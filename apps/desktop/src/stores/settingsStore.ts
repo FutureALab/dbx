@@ -909,13 +909,11 @@ export interface ToolbarItems {
   sqlFile: boolean;
   schemaDiff: boolean;
   dataCompare: boolean;
-  checkUpdates: boolean;
   sqlLibrary: boolean;
   sqlFileTree: boolean;
   history: boolean;
   ai: boolean;
   theme: boolean;
-  github: boolean;
   exclusiveRightSidebarPanels: boolean;
 }
 
@@ -926,13 +924,11 @@ export const DEFAULT_TOOLBAR_ITEMS: ToolbarItems = {
   sqlFile: true,
   schemaDiff: true,
   dataCompare: true,
-  checkUpdates: true,
   sqlLibrary: true,
   sqlFileTree: true,
   history: true,
   ai: true,
   theme: true,
-  github: true,
   exclusiveRightSidebarPanels: true,
 };
 
@@ -1388,13 +1384,11 @@ function normalizeToolbarItems(items: Partial<ToolbarItems> | undefined): Toolba
     sqlFile: items.sqlFile ?? defaults.sqlFile,
     schemaDiff: items.schemaDiff ?? defaults.schemaDiff,
     dataCompare: items.dataCompare ?? defaults.dataCompare,
-    checkUpdates: items.checkUpdates ?? defaults.checkUpdates,
     sqlLibrary: items.sqlLibrary ?? defaults.sqlLibrary,
     sqlFileTree: items.sqlFileTree ?? defaults.sqlFileTree,
     history: items.history ?? defaults.history,
     ai: items.ai ?? defaults.ai,
     theme: items.theme ?? defaults.theme,
-    github: items.github ?? defaults.github,
     // Saved settings from before right-sidebar exclusivity must adopt the new default.
     exclusiveRightSidebarPanels: items.exclusiveRightSidebarPanels !== false,
   };

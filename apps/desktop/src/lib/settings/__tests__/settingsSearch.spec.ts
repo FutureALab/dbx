@@ -28,7 +28,6 @@ const categoryLabels = {
   ai: "AI",
   mcp: "MCP",
   security: "Security",
-  about: "About",
 } satisfies Record<SettingsCategory, string>;
 
 const translations: Record<string, string> = {
@@ -44,7 +43,7 @@ describe("settings search", () => {
   const definitions: readonly SettingsSearchDefinition[] = [
     { id: "font", category: "editor", titleKey: "font", descriptionKey: "fontDescription" },
     { id: "export", category: "data", titleKey: "export" },
-    { id: "desktop", category: "about", titleKey: "hidden", visible: ({ isWeb }) => !isWeb },
+    { id: "desktop", category: "security", titleKey: "hidden", visible: ({ isWeb }) => !isWeb },
   ];
 
   it("indexes the query editor line-number preference", () => {
@@ -169,7 +168,7 @@ describe("settings search", () => {
   });
 
   it("returns matching categories in the navigation order", () => {
-    const entries = resolveSettingsSearchEntries(definitions, { isWeb: false, visibleCategories: new Set<SettingsCategory>(["data", "editor", "about"]) }, translate, categoryLabels);
+    const entries = resolveSettingsSearchEntries(definitions, { isWeb: false, visibleCategories: new Set<SettingsCategory>(["data", "editor", "security"]) }, translate, categoryLabels);
 
     expect(entries.map((entry) => entry.id)).toEqual(["export", "font", "desktop"]);
   });

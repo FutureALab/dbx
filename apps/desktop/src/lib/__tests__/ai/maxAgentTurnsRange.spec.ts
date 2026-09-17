@@ -30,7 +30,7 @@ describe("maxAgentTurnsOutOfRange", () => {
 describe("agent turn limit loading", () => {
   it("starts loading independently and blocks saves until the persisted value arrives", () => {
     const aiTabStart = settingsDialogSource.indexOf('if (tab === "ai") {');
-    const aiTabBranch = settingsDialogSource.slice(aiTabStart, settingsDialogSource.indexOf('if (tab === "about"', aiTabStart));
+    const aiTabBranch = settingsDialogSource.slice(aiTabStart, settingsDialogSource.indexOf('if (tab === "data"', aiTabStart));
     expect(aiTabBranch.indexOf("void loadMaxAgentTurnsSetting()")).toBeLessThan(aiTabBranch.indexOf("await promptTemplateStore.ensureLoaded()"));
     expect(settingsDialogSource).toContain("if (!maxAgentTurnsLoaded.value) return;");
     expect(settingsDialogSource).toContain(':disabled="!maxAgentTurnsLoaded || maxAgentTurnsSaving"');

@@ -443,8 +443,6 @@ describe("legacy WebView CSS fallbacks", () => {
     expect(editorSettingsDialogSource).toContain('class="settings-ai-back-button"');
     expect(fallback).toContain(".settings-ai-back-button");
     expect(fallback).toContain("margin-left: -0.625rem !important;");
-    expect(editorSettingsDialogSource).toContain("settings-about-section-header flex flex-col gap-3");
-    expect(editorSettingsDialogSource).toContain("settings-about-section-actions flex shrink-0 flex-wrap items-center gap-2");
     expect(changelogPanelSource).toContain("settings-about-section-header flex flex-col gap-3");
     expect(changelogPanelSource).toContain("settings-about-section-actions flex shrink-0 flex-wrap items-center gap-2");
     expect(fallback).toContain(".settings-about-section-header");

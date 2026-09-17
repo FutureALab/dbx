@@ -17,12 +17,6 @@ describe("EditorSettingsDialog shortcut restore-defaults exits edit state", () =
     expect(head).toContain("editingShortcutId.value = null;");
   });
 
-  it("resetAllDefaults clears the in-progress shortcut capture too", () => {
-    const start = dialogSource.indexOf("function resetAllDefaults() {");
-    const head = dialogSource.slice(start, dialogSource.indexOf("editFontFamily.value = DEFAULT_EDITOR_SETTINGS.fontFamily;", start));
-    expect(head).toContain("editingShortcutId.value = null;");
-  });
-
   it("keeps the footer restore-defaults button wired to resetDefaultsForTab", () => {
     expect(dialogSource).toContain('@click="resetDefaultsForTab(activeSettingsTab as SettingsCategory)"');
     expect(dialogSource).toContain('{{ t("settings.resetDefaults") }}');

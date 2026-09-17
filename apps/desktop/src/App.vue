@@ -229,9 +229,7 @@ const {
   updateReady,
   isIgnoringUpdate,
   activeTaskCount: activeUpdateTaskCount,
-  hasUpdateAvailable,
   openUrl,
-  checkUpdates,
   openLatestRelease,
   changeUpdateDownloadSource,
   ignoreCurrentVersion,
@@ -1174,7 +1172,6 @@ function openPluginConnectionDialog(pluginId: string, providerId: string) {
   showConnectionDialog.value = true;
 }
 const toolbarAgentDriverUpdateCount = computed(() => (updateNotificationsEnabled.value ? agentDriverUpdateCount.value : 0));
-const toolbarHasUpdateAvailable = computed(() => updateNotificationsEnabled.value && hasUpdateAvailable.value);
 const toolbarMcpUpdateAvailable = computed(() => updateNotificationsEnabled.value && mcpUpdateAvailable.value);
 const hasSqlFileConnections = computed(() => connectionStore.connections.some((c) => supportsSqlFileExecution(c.db_type)));
 const queryEditorDdlDatabaseType = computed(() => {
@@ -3754,13 +3751,6 @@ onUnmounted(() => {
           :show-driver-store="showDriverStore"
           :show-plugin-center="showPluginCenter"
           :show-settings-page="showSettingsPage"
-          :checking-updates="checkingUpdates"
-          :has-update-available="toolbarHasUpdateAvailable"
-          :is-downloading-update="isDownloadingUpdate"
-          :download-progress="downloadProgress"
-          :update-version="updateInfo?.latest_version"
-          :update-ready-to-install="updateDownloaded"
-          :update-ready="updateReady"
           :agent-driver-update-count="toolbarAgentDriverUpdateCount"
           :has-mcp-update-available="toolbarMcpUpdateAvailable"
           :has-connections="connectionStore.connections.length > 0"
@@ -3773,11 +3763,9 @@ onUnmounted(() => {
           @toggle-history="toggleRightSidebarPanel('history')"
           @toggle-sql-library="toggleRightSidebarPanel('sqlLibrary')"
           @toggle-sql-file-panel="toggleRightSidebarPanel('sqlFile')"
-          @open-github="openGitHub"
           @open-settings="openSettings(toolbarMcpUpdateAvailable ? 'mcp' : 'appearance')"
           @open-driver-store="openDriverStorePage"
           @open-plugin-center="openPluginCenterPage()"
-          @check-updates="checkUpdates()"
           @open-transfer="dialogs.showTransferDialog.value = true"
           @open-sql-file="dialogs.showSqlFileDialog.value = true"
           @open-schema-diff="dialogs.showSchemaDiffDialog.value = true"
@@ -3843,10 +3831,8 @@ onUnmounted(() => {
                   :ai-config-draft="settingsAiConfigDraft"
                   :ai-config-request-id="settingsAiConfigRequestId"
                   :app-version="appVersion"
-                  :checking-updates="checkingUpdates"
                   class="flex-1 min-h-0"
                   @update:open="(open: boolean) => (open ? activateSettingsPage() : closeSettingsPage())"
-                  @check-updates="checkUpdates()"
                   @ai-config-deep-link-handled="settingsAiConfigDraft = null"
                 />
               </AppTabBar>
