@@ -537,6 +537,9 @@ jobs:
   #   windows-arm64
   #   all
   # ============================================================
+  # ============================================================
+  # 4. Windows 10/11 offline 安装包
+  # ============================================================
   build-windows:
     name: build-windows (${{ matrix.arch }})
 
@@ -660,19 +663,17 @@ jobs:
             fi
           fi
 
+      # 关键修复：PowerShell 里不要用 bash 的 "\" 续行，全部改成单行。
       - name: Build frontend and Windows executable
         shell: pwsh
         run: |
-          pnpm tauri build \
-            --target ${{ matrix.target }} \
-            --config '{"bundle":{"createUpdaterArtifacts":false}}' \
-            --no-bundle
+          pnpm tauri build --target ${{ matrix.target }} --config '{"bundle":{"createUpdaterArtifacts":false}}' --no-bundle
 
+      # 关键修复：同上，把 pnpm tauri bundle 写成单行，避免 "\" 与 "`" 混用。
       - name: Build and upload WebView2 offline installer
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
         run: |
           $version = $env:RELEASE_VERSION
           $arch = "${{ matrix.arch }}"
@@ -689,11 +690,7 @@ jobs:
               }
           }
 
-          pnpm tauri bundle \
-            --bundles nsis \
-            --target ${{ matrix.target }} `
-            --config src-tauri/tauri.webview2-offline.conf.json
-            --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          pnpm tauri bundle --bundles nsis --target ${{ matrix.target }} --config src-tauri/tauri.webview2-offline.conf.json --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
           $installer = Get-ChildItem $bundleDir -Filter "*.exe" |
             Where-Object {
