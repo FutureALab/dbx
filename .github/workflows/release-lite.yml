@@ -1,14 +1,14 @@
-name: Release Lite (manual)
+name: Release
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, e.g. v0.6.15 or lite-v0.6.15"
+        description: "Release tag (must start with v, e.g. v0.6.15)"
         required: true
         type: string
       sign:
-        description: "Sign Windows / macOS artifacts (requires signing secrets & vars). Leave OFF for local use."
+        description: "Enable code signing (requires secrets/vars). Leave OFF for local use."
         required: false
         type: boolean
         default: false
@@ -16,11 +16,17 @@ on:
 permissions:
   contents: write
 
+env:
+  CNB_REPOSITORY: "dbxio.com/dbx"
+  CNB_USERNAME: "cnb"
+  CNB_REGISTRY: "docker.cnb.cool"
+
 jobs:
   # ============================================================
-  # 1. 规范化 tag + 创建 draft release
+  # 0. 准备 draft release
   # ============================================================
-  prepare-release:
+  prepare:
+    name: Prepare release
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.norm.outputs.tag }}
@@ -30,46 +36,131 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Normalize input tag
+      - name: Normalize tag
         id: norm
         shell: bash
         run: |
-          RAW="${{ inputs.tag }}"
-          RAW="${RAW#refs/tags/}"
-          RAW="${RAW#lite-v}"
-          RAW="${RAW#v}"
-          if ! [[ "$RAW" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::Invalid version '$RAW' (expected e.g. 0.6.15, v0.6.15 or lite-v0.6.15)"
+          TAG="${{ inputs.tag }}"
+          VERSION="${TAG#v}"
+          if [ -z "$TAG" ] || [ "$VERSION" = "$TAG" ]; then
+            echo "::error::Tag must start with 'v' (got: $TAG)"
             exit 1
           fi
-          echo "tag=lite-v${RAW}"   >> "$GITHUB_OUTPUT"
-          echo "version=${RAW}"     >> "$GITHUB_OUTPUT"
-          echo "Normalized: lite-v${RAW} (version ${RAW})"
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $TAG (version: $VERSION)"
 
-      - name: Create tag + draft release if missing
+      - name: Create draft release if missing
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           TAG="${{ steps.norm.outputs.tag }}"
-          REPO="${{ github.repository }}"
-          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-            echo "Draft release for $TAG already exists."
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, using it."
           else
             echo "Creating draft release $TAG on $(git rev-parse HEAD)"
             gh release create "$TAG" \
-              --repo "$REPO" \
+              --repo "${{ github.repository }}" \
               --draft \
               --title "$TAG" \
               --target "$(git rev-parse HEAD)"
           fi
 
   # ============================================================
-  # 2. macOS（x86_64 + aarch64）
+  # 1. Nix 打包（advisory）
   # ============================================================
-  build-macos:
+  nix-packaging:
+    needs: prepare
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Build Nix desktop package
+        run: nix build .#dbx-desktop --no-link --print-build-logs
+
+  # ============================================================
+  # 2. JDBC 插件版本 bump
+  # ============================================================
+  bump-jdbc-plugin-version:
+    needs: prepare
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.bump.outputs.changed }}
+      old_version: ${{ steps.bump.outputs.old_version }}
+      new_version: ${{ steps.bump.outputs.new_version }}
+      prev_tag: ${{ steps.prev-tag.outputs.prev_tag }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          fetch-depth: 0
+          token: ${{ secrets.MCP_RELEASE_TOKEN }}
+
+      - name: Find previous release tag
+        id: prev-tag
+        shell: bash
+        run: |
+          PREV_TAG=$(git tag --sort=-creatordate | grep '^v' | sed -n '2p')
+          if [ -z "$PREV_TAG" ]; then
+            PREV_TAG=$(git rev-list --max-parents=0 HEAD)
+          fi
+          echo "prev_tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Comparing ${PREV_TAG}..HEAD"
+
+      - name: Detect JDBC plugin changes and bump version
+        id: bump
+        shell: bash
+        run: |
+          BUMP_OUTPUT="$(node .github/scripts/bump-jdbc-plugin-version.mjs "${{ steps.prev-tag.outputs.prev_tag }}" HEAD --write)"
+          echo "$BUMP_OUTPUT"
+          echo "$BUMP_OUTPUT" >> "$GITHUB_OUTPUT"
+
+      - name: Commit JDBC plugin version bump
+        if: steps.bump.outputs.changed == 'true'
+        shell: bash
+        run: |
+          TMP_DIR="$(mktemp -d)"
+          cp plugins/jdbc/build.gradle "$TMP_DIR/build.gradle"
+          cp plugins/jdbc/manifest.json "$TMP_DIR/manifest.json"
+          git restore plugins/jdbc/build.gradle plugins/jdbc/manifest.json
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git switch -C jdbc-plugin-version-bump origin/main
+          cp "$TMP_DIR/build.gradle" plugins/jdbc/build.gradle
+          cp "$TMP_DIR/manifest.json" plugins/jdbc/manifest.json
+          git add plugins/jdbc/build.gradle plugins/jdbc/manifest.json
+          if git diff --cached --quiet; then
+            echo "JDBC plugin version ${{ steps.bump.outputs.new_version }} is already on main."
+            exit 0
+          fi
+          git commit -m "chore(jdbc): bump plugin version [skip ci]"
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::Unable to push JDBC plugin version bump after ${attempt} attempts."
+              exit 1
+            fi
+            git fetch origin main --no-tags
+            git rebase origin/main
+          done
+
+  # ============================================================
+  # 3. Linux + macOS 构建（deb / rpm / AppImage / dmg）
+  # ============================================================
+  build:
     name: build (${{ matrix.platform }}, ${{ matrix.target }})
-    needs: prepare-release
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
@@ -79,16 +170,23 @@ jobs:
             asset_pattern: "DBX_[version]_arm64[setup][ext]"
           - platform: macos-15-intel
             target: x86_64-apple-darwin
+          - platform: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - platform: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset_pattern: "DBX_[version]_arm64[setup][ext]"
+
     runs-on: ${{ matrix.platform }}
     env:
       CARGO_INCREMENTAL: "0"
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: ${{ secrets.SCCACHE_S3_BUCKET == '' && 'true' || 'false' }}
-      RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
+      SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ needs.prepare-release.outputs.tag }}
+          ref: ${{ needs.prepare.outputs.tag }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -166,47 +264,43 @@ jobs:
           cache-targets: false
           cache-on-failure: true
 
-      - name: Install Apple certificate (macOS)
-        if: ${{ inputs.sign }}
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      - name: Install system dependencies (Linux)
+        if: startsWith(matrix.platform, 'ubuntu')
         run: |
-          CERTIFICATE_PATH=$RUNNER_TEMP/certificate.p12
-          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
-          echo -n "$APPLE_CERTIFICATE" | base64 --decode -o $CERTIFICATE_PATH
-          security create-keychain -p "" $KEYCHAIN_PATH
-          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
-          security unlock-keychain -p "" $KEYCHAIN_PATH
-          security import $CERTIFICATE_PATH -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
-          security set-key-partition-list -S apple-tool:,apple: -k "" $KEYCHAIN_PATH
-          security list-keychains -d user -s $KEYCHAIN_PATH login.keychain-db
+          sudo apt-get update
+          # rpm is required so Tauri produces .rpm bundles
+          sudo apt-get install -y fcitx5-frontend-gtk3 ibus-gtk3 libwebkit2gtk-4.1-dev libgtk-3-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev xdg-utils rpm
 
-      - name: Setup Tauri signing key
+      - name: Setup Tauri signing key (optional)
         shell: bash
         run: |
-          echo "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_BASE64 }}" | base64 --decode > "$RUNNER_TEMP/updater.key"
-          KEY_B64=$(base64 < "$RUNNER_TEMP/updater.key" | tr -d '\r\n')
-          echo "TAURI_SIGNING_PRIVATE_KEY=$KEY_B64" >> "$GITHUB_ENV"
-          if [ -n "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}" ]; then
-            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}" >> "$GITHUB_ENV"
+          if [ -n "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_BASE64 }}" ]; then
+            echo "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_BASE64 }}" | base64 --decode > "$RUNNER_TEMP/updater.key"
+            KEY_B64=$(base64 < "$RUNNER_TEMP/updater.key" | tr -d '\r\n')
+            echo "TAURI_SIGNING_PRIVATE_KEY=$KEY_B64" >> "$GITHUB_ENV"
+            if [ -n "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}" ]; then
+              echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}" >> "$GITHUB_ENV"
+            fi
+          else
+            echo "No TAURI_SIGNING_PRIVATE_KEY_BASE64; skipping updater key setup."
           fi
 
+      # 注意：这里不传任何 APPLE_* 环境变量。Tauri 会走默认 ad-hoc 签名，
+      # 不会触发 notarize，因此不会出现 "Team ID must be at least 3 characters"。
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # When sign=true use the real identity; otherwise use ad-hoc "-" so
-          # the DMG can still be produced without a Developer ID certificate.
-          APPLE_SIGNING_IDENTITY: ${{ inputs.sign && secrets.APPLE_SIGNING_IDENTITY || '-' }}
-          APPLE_ID: ${{ inputs.sign && secrets.APPLE_ID || '' }}
-          APPLE_PASSWORD: ${{ inputs.sign && secrets.APPLE_PASSWORD || '' }}
-          APPLE_TEAM_ID: ${{ inputs.sign && secrets.APPLE_TEAM_ID || '' }}
         with:
-          tagName: ${{ needs.prepare-release.outputs.tag }}
+          tagName: ${{ needs.prepare.outputs.tag }}
           releaseDraft: true
           assetNamePattern: ${{ matrix.asset_pattern }}
           args: --target ${{ matrix.target }}
+
+      - name: Verify AppImage input methods
+        if: startsWith(matrix.platform, 'ubuntu')
+        shell: bash
+        run: ./.github/scripts/verify-appimage-input-methods.sh "target/${{ matrix.target }}/release/bundle/appimage"
 
       - name: Show sccache stats
         if: always()
@@ -215,12 +309,10 @@ jobs:
         run: ${SCCACHE_PATH} --show-stats
 
   # ============================================================
-  # 3. Windows 10/11 offline 安装包（x64 + arm64）
+  # 4. Windows 10/11 offline 安装包（x64 + arm64）
   # ============================================================
-  build-windows-10-offline:
-    name: win10-offline (${{ matrix.arch }})
-    needs: prepare-release
-    environment: release-signing
+  build-windows:
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
@@ -234,17 +326,13 @@ jobs:
       CARGO_INCREMENTAL: "0"
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: ${{ secrets.SCCACHE_S3_BUCKET == '' && 'true' || 'false' }}
-      VSIGN_CERT_HASH: ${{ vars.VSIGN_CERT_HASH }}
-      VSIGN_OPERATOR_SHA1: ${{ vars.VSIGN_OPERATOR_SHA1 }}
-      VSIGN_SERVER: ${{ vars.VSIGN_SERVER }}
-      VSIGN_TOOL_SHA256: ${{ vars.VSIGN_TOOL_SHA256 }}
-      RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
-      RELEASE_VERSION: ${{ needs.prepare-release.outputs.version }}
-      DO_SIGN: ${{ inputs.sign && 'true' || 'false' }}
+      SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ needs.prepare-release.outputs.tag }}
+          ref: ${{ needs.prepare.outputs.tag }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -312,23 +400,17 @@ jobs:
           cache-targets: false
           cache-on-failure: true
 
-      - name: Setup Tauri signing key
+      - name: Setup Tauri signing key (optional)
         shell: bash
         run: |
-          echo "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_BASE64 }}" | base64 --decode > "$RUNNER_TEMP/updater.key"
-          KEY_B64=$(base64 < "$RUNNER_TEMP/updater.key" | tr -d '\r\n')
-          echo "TAURI_SIGNING_PRIVATE_KEY=$KEY_B64" >> "$GITHUB_ENV"
-          if [ -n "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}" ]; then
-            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}" >> "$GITHUB_ENV"
+          if [ -n "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_BASE64 }}" ]; then
+            echo "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_BASE64 }}" | base64 --decode > "$RUNNER_TEMP/updater.key"
+            KEY_B64=$(base64 < "$RUNNER_TEMP/updater.key" | tr -d '\r\n')
+            echo "TAURI_SIGNING_PRIVATE_KEY=$KEY_B64" >> "$GITHUB_ENV"
+            if [ -n "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}" ]; then
+              echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}" >> "$GITHUB_ENV"
+            fi
           fi
-
-      - name: Setup TrustAsia VSign
-        if: env.DO_SIGN == 'true'
-        shell: pwsh
-        env:
-          VSIGN_OPERATOR_PFX_B64: ${{ secrets.VSIGN_OPERATOR_PFX_B64 }}
-          VSIGN_OPERATOR_PWD: ${{ secrets.VSIGN_OPERATOR_PWD }}
-        run: ./.github/scripts/setup-vsign.ps1
 
       - name: Build frontend and Windows executable
         shell: pwsh
@@ -338,8 +420,6 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SSIGNCODE_OPERATOR_PWD: ${{ secrets.VSIGN_OPERATOR_PWD }}
-          VSIGN_KEY_PIN: ${{ secrets.VSIGN_KEY_PIN }}
         run: |
           $version = $env:RELEASE_VERSION
           $arch = "${{ matrix.arch }}"
@@ -351,14 +431,8 @@ jobs:
             Get-ChildItem $bundleDir -Filter "*.exe" | ForEach-Object { $before[$_.FullName] = $_.LastWriteTimeUtc }
           }
 
-          if ($env:DO_SIGN -eq "true") {
-            pnpm tauri bundle --bundles nsis --target ${{ matrix.target }} `
-              --config src-tauri/tauri.webview2-offline.conf.json `
-              --config src-tauri/tauri.vsign.conf.json
-          } else {
-            pnpm tauri bundle --bundles nsis --target ${{ matrix.target }} `
-              --config src-tauri/tauri.webview2-offline.conf.json
-          }
+          pnpm tauri bundle --bundles nsis --target ${{ matrix.target }} `
+            --config src-tauri/tauri.webview2-offline.conf.json
 
           $installer = Get-ChildItem $bundleDir -Filter "*.exe" |
             Where-Object { !$before.ContainsKey($_.FullName) -or $_.LastWriteTimeUtc -gt $before[$_.FullName] } |
@@ -367,10 +441,6 @@ jobs:
 
           if (!$installer) {
             throw "Missing WebView2 offline installer in ${bundleDir}"
-          }
-
-          if ($env:DO_SIGN -eq "true") {
-            ./.github/scripts/assert-authenticode.ps1 -Path $installer.FullName
           }
 
           Copy-Item $installer.FullName $offlineName -Force
@@ -383,41 +453,21 @@ jobs:
         shell: bash
         run: ${SCCACHE_PATH} --show-stats
 
-      - name: Remove temporary VSign files
-        if: always()
-        shell: pwsh
-        run: |
-          $workDir = if ([string]::IsNullOrWhiteSpace($env:VSIGN_WORK_DIR)) {
-            Join-Path $env:RUNNER_TEMP "vsign-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          } else {
-            $env:VSIGN_WORK_DIR
-          }
-          if (Test-Path -LiteralPath $workDir) {
-            Remove-Item -LiteralPath $workDir -Recurse -Force
-          }
-
   # ============================================================
-  # 4. Windows 7 / Server 2012 R2 offline 安装包
+  # 5. Windows 7 / Server 2012 R2 offline（仅 x64）
   # ============================================================
   build-windows-7-offline:
-    name: win7-offline
-    needs: prepare-release
+    needs: prepare
     runs-on: windows-2022
-    environment: release-signing
     env:
       CARGO_INCREMENTAL: "0"
       RUSTFLAGS: -C debuginfo=line-tables-only -C target-feature=+crt-static
-      VSIGN_CERT_HASH: ${{ vars.VSIGN_CERT_HASH }}
-      VSIGN_OPERATOR_SHA1: ${{ vars.VSIGN_OPERATOR_SHA1 }}
-      VSIGN_SERVER: ${{ vars.VSIGN_SERVER }}
-      VSIGN_TOOL_SHA256: ${{ vars.VSIGN_TOOL_SHA256 }}
-      RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
-      RELEASE_VERSION: ${{ needs.prepare-release.outputs.version }}
-      DO_SIGN: ${{ inputs.sign && 'true' || 'false' }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ needs.prepare-release.outputs.tag }}
+          ref: ${{ needs.prepare.outputs.tag }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -474,20 +524,10 @@ jobs:
         shell: pwsh
         run: ./.github/scripts/assert-webview2-win7-loader.ps1 -BinaryPath target/x86_64-win7-windows-msvc/release/dbx.exe
 
-      - name: Setup TrustAsia VSign
-        if: env.DO_SIGN == 'true'
-        shell: pwsh
-        env:
-          VSIGN_OPERATOR_PFX_B64: ${{ secrets.VSIGN_OPERATOR_PFX_B64 }}
-          VSIGN_OPERATOR_PWD: ${{ secrets.VSIGN_OPERATOR_PWD }}
-        run: ./.github/scripts/setup-vsign.ps1
-
       - name: Bundle and upload Windows 7 / Server 2012 R2 fixed-runtime installer
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SSIGNCODE_OPERATOR_PWD: ${{ secrets.VSIGN_OPERATOR_PWD }}
-          VSIGN_KEY_PIN: ${{ secrets.VSIGN_KEY_PIN }}
         run: |
           $version = $env:RELEASE_VERSION
           $bundleDir = "target/x86_64-win7-windows-msvc/release/bundle/nsis"
@@ -501,14 +541,8 @@ jobs:
             exit 1
           }
 
-          if ($env:DO_SIGN -eq "true") {
-            pnpm tauri bundle --bundles nsis --target x86_64-win7-windows-msvc `
-              --config src-tauri/tauri.webview2-win7-fixed.conf.json `
-              --config src-tauri/tauri.vsign.conf.json
-          } else {
-            pnpm tauri bundle --bundles nsis --target x86_64-win7-windows-msvc `
-              --config src-tauri/tauri.webview2-win7-fixed.conf.json
-          }
+          pnpm tauri bundle --bundles nsis --target x86_64-win7-windows-msvc `
+            --config src-tauri/tauri.webview2-win7-fixed.conf.json
 
           $installer = Get-ChildItem $bundleDir -Filter "*.exe" |
             Sort-Object LastWriteTimeUtc -Descending |
@@ -519,9 +553,6 @@ jobs:
           }
 
           ./.github/scripts/assert-win7-installer-content.ps1 -InstallerPath $installer.FullName
-          if ($env:DO_SIGN -eq "true") {
-            ./.github/scripts/assert-authenticode.ps1 -Path $installer.FullName
-          }
 
           Copy-Item $installer.FullName $offlineName -Force
           $hash = (Get-FileHash -LiteralPath $offlineName -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -529,30 +560,444 @@ jobs:
           gh release upload "${env:RELEASE_TAG}" $offlineName $checksumName `
             --repo "${env:GITHUB_REPOSITORY}" --clobber
 
-      - name: Remove temporary VSign files
-        if: always()
-        shell: pwsh
+  # ============================================================
+  # 6. Linux 静态浏览器（musl）
+  # ============================================================
+  static-browser:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            arch: x64
+            rustflags: "-C target-feature=+crt-static"
+          - platform: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+            arch: arm64
+            rustflags: "-C target-feature=+crt-static -C link-arg=-z -C link-arg=max-page-size=65536"
+    runs-on: ${{ matrix.platform }}
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: ${{ secrets.SCCACHE_S3_BUCKET == '' && 'true' || 'false' }}
+      SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Install frontend dependencies
+        run: pnpm install
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cargo-zigbuild
+        run: pip3 install cargo-zigbuild
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        with:
+          version: "v0.10.0"
+
+      - name: Configure S3 sccache
+        if: env.SCCACHE_GHA_ENABLED != 'true'
+        shell: bash
+        env:
+          CACHE_BUCKET: ${{ secrets.SCCACHE_S3_BUCKET }}
+          CACHE_ENDPOINT: ${{ secrets.SCCACHE_S3_ENDPOINT }}
+          CACHE_REGION: ${{ secrets.SCCACHE_S3_REGION }}
+          CACHE_KEY_PREFIX: ${{ secrets.SCCACHE_S3_KEY_PREFIX }}
+          CACHE_ACCESS_KEY_ID: ${{ secrets.SCCACHE_S3_ACCESS_KEY_ID }}
+          CACHE_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_S3_SECRET_ACCESS_KEY }}
         run: |
-          $workDir = if ([string]::IsNullOrWhiteSpace($env:VSIGN_WORK_DIR)) {
-            Join-Path $env:RUNNER_TEMP "vsign-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          } else {
-            $env:VSIGN_WORK_DIR
-          }
-          if (Test-Path -LiteralPath $workDir) {
-            Remove-Item -LiteralPath $workDir -Recurse -Force
-          }
+          {
+            echo "SCCACHE_BUCKET=${CACHE_BUCKET}"
+            echo "SCCACHE_ENDPOINT=${CACHE_ENDPOINT}"
+            echo "SCCACHE_REGION=${CACHE_REGION}"
+            echo "SCCACHE_S3_KEY_PREFIX=${CACHE_KEY_PREFIX}"
+            echo "SCCACHE_S3_USE_SSL=true"
+            echo "AWS_ACCESS_KEY_ID=${CACHE_ACCESS_KEY_ID}"
+            echo "AWS_SECRET_ACCESS_KEY=${CACHE_SECRET_ACCESS_KEY}"
+            echo "SCCACHE_IDLE_TIMEOUT=0"
+            echo "CC=${SCCACHE_PATH} cc"
+            echo "CXX=${SCCACHE_PATH} c++"
+          } >> "$GITHUB_ENV"
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./ -> target"
+          shared-key: static-browser-${{ matrix.target }}
+          cache-on-failure: true
+
+      - name: Build frontend
+        run: pnpm build
+
+      - name: Build static web binary
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: |
+          cargo zigbuild --release -p dbx-web --target ${{ matrix.target }} \
+            --no-default-features --features "duckdb-sidecar,dynamodb,mq-admin,dbx-core/sqlite-bundled"
+
+      - name: Package static browser runtime
+        env:
+          DBX_STATIC_TARGET: ${{ matrix.target }}
+        run: |
+          chmod +x scripts/package-web-static.sh scripts/verify-web-static.sh
+          ./scripts/package-web-static.sh
+
+      - name: Verify inside oldest available Ubuntu container
+        run: |
+          VERIFY_IMAGE=""
+          for image in ubuntu:14.04 ubuntu:16.04; do
+            if docker pull "$image" >/dev/null 2>&1; then
+              VERIFY_IMAGE="$image"
+              break
+            fi
+          done
+          if [ -z "$VERIFY_IMAGE" ]; then
+            echo "no legacy Ubuntu image available for $(uname -m)" >&2
+            exit 1
+          fi
+          echo "Verifying in $VERIFY_IMAGE"
+          docker run --rm -v "$PWD:/workspace" -w /workspace "$VERIFY_IMAGE" \
+            bash scripts/verify-web-static.sh \
+            "dist-web-static/dbx-linux-${{ matrix.arch }}-browser-static.tar.gz"
+
+      - name: Upload release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="$RELEASE_VERSION"
+          PACKAGE_VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "dbx-web") | .version')"
+          if [ "$PACKAGE_VERSION" != "$VERSION" ]; then
+            echo "Release tag version $VERSION does not match dbx-web package version $PACKAGE_VERSION" >&2
+            exit 1
+          fi
+          SOURCE="dist-web-static/dbx-linux-${{ matrix.arch }}-browser-static.tar.gz"
+          ASSET="DBX_${VERSION}_${{ matrix.arch }}-browser-static.tar.gz"
+          CHECKSUM="${ASSET}.sha256"
+          cp "$SOURCE" "$ASSET"
+          sha256sum "$ASSET" | tee "$CHECKSUM"
+          gh release upload "$RELEASE_TAG" "$ASSET" "$CHECKSUM" \
+            --repo "${GITHUB_REPOSITORY}" --clobber
+
+      - name: Show sccache stats
+        if: always()
+        continue-on-error: true
+        run: ${SCCACHE_PATH} --show-stats
 
   # ============================================================
-  # 5. 发布（把 draft 变成 prerelease）
+  # 7. 清理多余的 .sig
+  # ============================================================
+  cleanup-release-signatures:
+    needs: [prepare, build, build-windows, build-windows-7-offline]
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - name: Remove standalone updater signature assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          mapfile -t SIG_ASSETS < <(
+            gh release view "$RELEASE_TAG" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --json assets \
+              --jq '.assets[].name | select(endswith(".sig") and (endswith("-portable.zip.sig") | not))'
+          )
+
+          if [ "${#SIG_ASSETS[@]}" -eq 0 ]; then
+            echo "No standalone .sig release assets found."
+            exit 0
+          fi
+
+          for ASSET in "${SIG_ASSETS[@]}"; do
+            echo "Deleting release asset: ${ASSET}"
+            gh release delete-asset "$RELEASE_TAG" "${ASSET}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --yes
+          done
+
+  # ============================================================
+  # 8. JDBC 插件
+  # ============================================================
+  jdbc-plugin:
+    needs: [prepare, cleanup-release-signatures, bump-jdbc-plugin-version]
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      - name: Apply automatic JDBC plugin version bump
+        shell: bash
+        run: node .github/scripts/bump-jdbc-plugin-version.mjs "${{ needs.bump-jdbc-plugin-version.outputs.prev_tag }}" HEAD --write
+
+      - name: Read JDBC plugin version
+        id: jdbc-plugin
+        shell: bash
+        run: |
+          VERSION="$(sed -nE "s/^version[[:space:]]*=[[:space:]]*'([^']+)'.*/\1/p" plugins/jdbc/build.gradle | head -n 1)"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Package JDBC plugin
+        run: ./plugins/jdbc/package.sh
+
+      - name: Upload JDBC plugin asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "$RELEASE_TAG" \
+            "plugins/jdbc/dist/dbx-jdbc-plugin-${{ steps.jdbc-plugin.outputs.version }}.zip" \
+            "plugins/jdbc/dist/dbx-jdbc-plugin-latest.zip" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber
+
+      - name: Add JDBC plugin metadata to latest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/latest-json"
+          if ! gh release download "$RELEASE_TAG" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --pattern latest.json \
+              --dir "$RUNNER_TEMP/latest-json" 2>/dev/null; then
+            echo "No latest.json asset in this release, skipping."
+            exit 0
+          fi
+          node .github/scripts/augment-latest-json-jdbc-plugin.mjs \
+            "$RUNNER_TEMP/latest-json/latest.json" \
+            "${{ steps.jdbc-plugin.outputs.version }}" \
+            "1" \
+            "https://github.com/t8y2/dbx/releases/latest/download/dbx-jdbc-plugin-latest.zip"
+          gh release upload "$RELEASE_TAG" \
+            "$RUNNER_TEMP/latest-json/latest.json" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber
+
+  # ============================================================
+  # 9. Docker 镜像
+  # ============================================================
+  docker:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to CNB Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.CNB_REGISTRY }}
+          username: cnb
+          password: ${{ secrets.CNB_TOKEN }}
+
+      - name: Build and push Docker Hub by digest
+        id: build-dockerhub
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ secrets.DOCKERHUB_USERNAME }}/dbx,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,scope=${{ matrix.platform }},mode=max
+
+      - name: Build and push CNB by digest
+        id: build-cnb
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.CNB_REGISTRY }}/${{ env.CNB_REPOSITORY }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.platform }}
+
+      - name: Export digests
+        run: |
+          mkdir -p /tmp/digests/dockerhub /tmp/digests/cnb
+          dockerhub_digest="${{ steps.build-dockerhub.outputs.digest }}"
+          cnb_digest="${{ steps.build-cnb.outputs.digest }}"
+          touch "/tmp/digests/dockerhub/${dockerhub_digest#sha256:}"
+          touch "/tmp/digests/cnb/${cnb_digest#sha256:}"
+
+      - name: Upload Docker Hub digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: dockerhub-digests-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: /tmp/digests/dockerhub/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload CNB digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: cnb-digests-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: /tmp/digests/cnb/*
+          if-no-files-found: error
+          retention-days: 1
+
+  docker-manifest:
+    needs: [prepare, docker]
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Download Docker Hub digests
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests/dockerhub
+          pattern: dockerhub-digests-*
+          merge-multiple: true
+
+      - name: Download CNB digests
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests/cnb
+          pattern: cnb-digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to CNB Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.CNB_REGISTRY }}
+          username: cnb
+          password: ${{ secrets.CNB_TOKEN }}
+
+      - name: Create manifest list and push
+        run: |
+          docker buildx imagetools create \
+            -t ${{ secrets.DOCKERHUB_USERNAME }}/dbx:${RELEASE_VERSION} \
+            -t ${{ secrets.DOCKERHUB_USERNAME }}/dbx:latest \
+            $(cd /tmp/digests/dockerhub && printf '${{ secrets.DOCKERHUB_USERNAME }}/dbx@sha256:%s ' *)
+
+          docker buildx imagetools create \
+            -t ${{ env.CNB_REGISTRY }}/${{ env.CNB_REPOSITORY }}:${RELEASE_VERSION} \
+            -t ${{ env.CNB_REGISTRY }}/${{ env.CNB_REPOSITORY }}:latest \
+            $(cd /tmp/digests/cnb && printf '${{ env.CNB_REGISTRY }}/${{ env.CNB_REPOSITORY }}@sha256:%s ' *)
+
+  # ============================================================
+  # 10. 发布
   # ============================================================
   publish:
-    needs: [prepare-release, build-macos, build-windows-10-offline, build-windows-7-offline]
+    needs: [prepare, cleanup-release-signatures, docker-manifest, jdbc-plugin, static-browser]
     runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
     steps:
       - name: Publish draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release edit "${{ needs.prepare-release.outputs.tag }}" \
+          gh release edit "$RELEASE_TAG" \
             --repo "${{ github.repository }}" \
             --draft=false --prerelease
+
+  # ============================================================
+  # 11. 同步到 CNB（可选；无需可整段删掉）
+  # ============================================================
+  sync-release-to-cnb:
+    name: Sync release to CNB
+    needs: [prepare, publish]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Download GitHub release assets
+        env:
+          TAG_NAME: ${{ needs.prepare.outputs.tag }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/github-release" "$RUNNER_TEMP/release-assets"
+          gh release view "$TAG_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,name,body,targetCommitish,isPrerelease,isDraft,assets \
+            > "$RUNNER_TEMP/github-release/release.json"
+          gh release download "$TAG_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$RUNNER_TEMP/release-assets" \
+            --clobber
+
+      - name: Sync release assets to CNB
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+          CNB_UPLOAD_CONCURRENCY: "3"
+        run: |
+          node .github/scripts/sync-cnb-release.mjs \
+            --github-release "$RUNNER_TEMP/github-release/release.json" \
+            --assets-dir "$RUNNER_TEMP/release-assets"
+
+      - name: Keep latest five app releases in CNB
+        continue-on-error: true
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+          CURRENT_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          node .github/scripts/cleanup-cnb-releases.mjs \
+            --current-tag "$CURRENT_TAG" \
+            --tag-pattern '^v[0-9]+[.][0-9]+[.][0-9]+([.-][0-9A-Za-z.-]+)?$' \
+            --retain 5 \
+            --apply
