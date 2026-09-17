@@ -26,6 +26,7 @@ on:
           - static-browser-arm64
           - docker
           - jdbc
+          - finalize
 
       sign:
         description: "Enable code signing (requires secrets/vars). Leave OFF for local use."
@@ -69,6 +70,9 @@ jobs:
     outputs:
       tag: ${{ steps.norm.outputs.tag }}
       version: ${{ steps.norm.outputs.version }}
+      build_matrix: ${{ steps.matrices.outputs.build_matrix }}
+      windows_matrix: ${{ steps.matrices.outputs.windows_matrix }}
+      static_matrix: ${{ steps.matrices.outputs.static_matrix }}
 
     steps:
       - uses: actions/checkout@v5
@@ -103,6 +107,9 @@ jobs:
 
           if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             echo "Release $TAG already exists, using it."
+          elif [ "${{ inputs.target }}" = "finalize" ]; then
+            echo "::error::Release $TAG does not exist. Run one or more build targets first."
+            exit 1
           else
             echo "Creating draft release $TAG on $(git rev-parse HEAD)"
 
@@ -112,6 +119,94 @@ jobs:
               --title "$TAG" \
               --target "$(git rev-parse HEAD)"
           fi
+
+
+      - name: Define selected build matrices
+        id: matrices
+        shell: bash
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          set -euo pipefail
+
+          EMPTY='{"include":[]}'
+
+          case "$TARGET" in
+            all)
+              BUILD_MATRIX="$(jq -cn '{include:[
+                {platform:"macos-latest",target:"aarch64-apple-darwin",release_target:"macos-arm64",asset_pattern:"DBX_[version]_arm64[setup][ext]"},
+                {platform:"macos-15-intel",target:"x86_64-apple-darwin",release_target:"macos-x64"},
+                {platform:"ubuntu-22.04",target:"x86_64-unknown-linux-gnu",release_target:"linux-x64"},
+                {platform:"ubuntu-22.04-arm",target:"aarch64-unknown-linux-gnu",release_target:"linux-arm64",asset_pattern:"DBX_[version]_arm64[setup][ext]"}
+              ]}')"
+              WINDOWS_MATRIX="$(jq -cn '{include:[
+                {target:"x86_64-pc-windows-msvc",arch:"x64",release_target:"windows-x64"},
+                {target:"aarch64-pc-windows-msvc",arch:"arm64",release_target:"windows-arm64"}
+              ]}')"
+              STATIC_MATRIX="$(jq -cn '{include:[
+                {platform:"ubuntu-22.04",target:"x86_64-unknown-linux-musl",arch:"x64",release_target:"static-browser-x64",rustflags:"-C target-feature=+crt-static"},
+                {platform:"ubuntu-22.04-arm",target:"aarch64-unknown-linux-musl",arch:"arm64",release_target:"static-browser-arm64",rustflags:"-C target-feature=+crt-static -C link-arg=-z -C link-arg=max-page-size=65536"}
+              ]}')"
+              ;;
+            macos-arm64)
+              BUILD_MATRIX="$(jq -cn '{include:[{platform:"macos-latest",target:"aarch64-apple-darwin",release_target:"macos-arm64",asset_pattern:"DBX_[version]_arm64[setup][ext]"}]}')"
+              WINDOWS_MATRIX="$EMPTY"
+              STATIC_MATRIX="$EMPTY"
+              ;;
+            macos-x64)
+              BUILD_MATRIX="$(jq -cn '{include:[{platform:"macos-15-intel",target:"x86_64-apple-darwin",release_target:"macos-x64"}]}')"
+              WINDOWS_MATRIX="$EMPTY"
+              STATIC_MATRIX="$EMPTY"
+              ;;
+            linux-x64)
+              BUILD_MATRIX="$(jq -cn '{include:[{platform:"ubuntu-22.04",target:"x86_64-unknown-linux-gnu",release_target:"linux-x64"}]}')"
+              WINDOWS_MATRIX="$EMPTY"
+              STATIC_MATRIX="$EMPTY"
+              ;;
+            linux-arm64)
+              BUILD_MATRIX="$(jq -cn '{include:[{platform:"ubuntu-22.04-arm",target:"aarch64-unknown-linux-gnu",release_target:"linux-arm64",asset_pattern:"DBX_[version]_arm64[setup][ext]"}]}')"
+              WINDOWS_MATRIX="$EMPTY"
+              STATIC_MATRIX="$EMPTY"
+              ;;
+            windows-x64)
+              BUILD_MATRIX="$EMPTY"
+              WINDOWS_MATRIX="$(jq -cn '{include:[{target:"x86_64-pc-windows-msvc",arch:"x64",release_target:"windows-x64"}]}')"
+              STATIC_MATRIX="$EMPTY"
+              ;;
+            windows-arm64)
+              BUILD_MATRIX="$EMPTY"
+              WINDOWS_MATRIX="$(jq -cn '{include:[{target:"aarch64-pc-windows-msvc",arch:"arm64",release_target:"windows-arm64"}]}')"
+              STATIC_MATRIX="$EMPTY"
+              ;;
+            static-browser-x64)
+              BUILD_MATRIX="$EMPTY"
+              WINDOWS_MATRIX="$EMPTY"
+              STATIC_MATRIX="$(jq -cn '{include:[{platform:"ubuntu-22.04",target:"x86_64-unknown-linux-musl",arch:"x64",release_target:"static-browser-x64",rustflags:"-C target-feature=+crt-static"}]}')"
+              ;;
+            static-browser-arm64)
+              BUILD_MATRIX="$EMPTY"
+              WINDOWS_MATRIX="$EMPTY"
+              STATIC_MATRIX="$(jq -cn '{include:[{platform:"ubuntu-22.04-arm",target:"aarch64-unknown-linux-musl",arch:"arm64",release_target:"static-browser-arm64",rustflags:"-C target-feature=+crt-static -C link-arg=-z -C link-arg=max-page-size=65536"}]}')"
+              ;;
+            windows7-x64|docker|jdbc|finalize)
+              BUILD_MATRIX="$EMPTY"
+              WINDOWS_MATRIX="$EMPTY"
+              STATIC_MATRIX="$EMPTY"
+              ;;
+            *)
+              echo "::error::Unsupported target: $TARGET"
+              exit 1
+              ;;
+          esac
+
+          printf 'build_matrix=%s\n' "$BUILD_MATRIX" >> "$GITHUB_OUTPUT"
+          printf 'windows_matrix=%s\n' "$WINDOWS_MATRIX" >> "$GITHUB_OUTPUT"
+          printf 'static_matrix=%s\n' "$STATIC_MATRIX" >> "$GITHUB_OUTPUT"
+
+          echo "Selected target: $TARGET"
+          echo "Build matrix: $BUILD_MATRIX"
+          echo "Windows matrix: $WINDOWS_MATRIX"
+          echo "Static browser matrix: $STATIC_MATRIX"
 
 
   # ============================================================
@@ -266,31 +361,16 @@ jobs:
     strategy:
       fail-fast: false
 
-      matrix:
-        include:
-          - platform: macos-latest
-            target: aarch64-apple-darwin
-            release_target: macos-arm64
-            asset_pattern: "DBX_[version]_arm64[setup][ext]"
-
-          - platform: macos-15-intel
-            target: x86_64-apple-darwin
-            release_target: macos-x64
-
-          - platform: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            release_target: linux-x64
-
-          - platform: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
-            release_target: linux-arm64
-            asset_pattern: "DBX_[version]_arm64[setup][ext]"
+      matrix: ${{ fromJSON(needs.prepare.outputs.build_matrix) }}
 
     runs-on: ${{ matrix.platform }}
 
     env:
       CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
       RUSTC_WRAPPER: sccache
+      SCCACHE_IDLE_TIMEOUT: "0"
+      SCCACHE_LOG: "warn"
       SCCACHE_GHA_ENABLED: ${{ secrets.SCCACHE_S3_BUCKET == '' && 'true' || 'false' }}
       SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
       RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
@@ -299,17 +379,6 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ needs.prepare.outputs.tag }}
-
-      - name: Check selected target
-        shell: bash
-        run: |
-          if [ "${{ inputs.target }}" != "all" ] && \
-             [ "${{ inputs.target }}" != "${{ matrix.release_target }}" ]; then
-            echo "Skipping ${{ matrix.release_target }}"
-            exit 0
-          fi
-
-          echo "Building ${{ matrix.release_target }}"
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -327,12 +396,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
-        with:
-          version: "v0.10.0"
-
-      - name: Configure S3 sccache
+      - name: Configure S3 sccache backend
         if: env.SCCACHE_GHA_ENABLED != 'true'
         shell: bash
         env:
@@ -342,7 +406,6 @@ jobs:
           CACHE_KEY_PREFIX: ${{ secrets.SCCACHE_S3_KEY_PREFIX }}
           CACHE_ACCESS_KEY_ID: ${{ secrets.SCCACHE_S3_ACCESS_KEY_ID }}
           CACHE_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_S3_SECRET_ACCESS_KEY }}
-
         run: |
           {
             echo "SCCACHE_BUCKET=${CACHE_BUCKET}"
@@ -352,19 +415,30 @@ jobs:
             echo "SCCACHE_S3_USE_SSL=true"
             echo "AWS_ACCESS_KEY_ID=${CACHE_ACCESS_KEY_ID}"
             echo "AWS_SECRET_ACCESS_KEY=${CACHE_SECRET_ACCESS_KEY}"
-            echo "SCCACHE_IDLE_TIMEOUT=0"
-
-            case "${RUNNER_OS}" in
-              Linux)
-                echo "CC=${SCCACHE_PATH} cc"
-                echo "CXX=${SCCACHE_PATH} c++"
-                ;;
-              macOS)
-                echo "CC=${SCCACHE_PATH} clang"
-                echo "CXX=${SCCACHE_PATH} clang++"
-                ;;
-            esac
           } >> "$GITHUB_ENV"
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        with:
+          version: "v0.10.0"
+
+      - name: Start and verify sccache server
+        shell: bash
+        run: |
+          set -e
+          sccache --start-server
+          sccache --show-stats
+
+          case "${RUNNER_OS}" in
+            Linux)
+              echo "CC=${SCCACHE_PATH} cc" >> "$GITHUB_ENV"
+              echo "CXX=${SCCACHE_PATH} c++" >> "$GITHUB_ENV"
+              ;;
+            macOS)
+              echo "CC=${SCCACHE_PATH} clang" >> "$GITHUB_ENV"
+              echo "CXX=${SCCACHE_PATH} clang++" >> "$GITHUB_ENV"
+              ;;
+          esac
 
       - name: Compute Rust dependency hash
         id: deps-hash
@@ -474,21 +548,16 @@ jobs:
     strategy:
       fail-fast: false
 
-      matrix:
-        include:
-          - target: x86_64-pc-windows-msvc
-            arch: x64
-            release_target: windows-x64
-
-          - target: aarch64-pc-windows-msvc
-            arch: arm64
-            release_target: windows-arm64
+      matrix: ${{ fromJSON(needs.prepare.outputs.windows_matrix) }}
 
     runs-on: windows-2022
 
     env:
       CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
       RUSTC_WRAPPER: sccache
+      SCCACHE_IDLE_TIMEOUT: "0"
+      SCCACHE_LOG: "warn"
       SCCACHE_GHA_ENABLED: ${{ secrets.SCCACHE_S3_BUCKET == '' && 'true' || 'false' }}
       SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
       RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
@@ -498,19 +567,6 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ needs.prepare.outputs.tag }}
-
-      - name: Check selected target
-        shell: pwsh
-        run: |
-          if (
-            "${{ inputs.target }}" -ne "all" -and
-            "${{ inputs.target }}" -ne "${{ matrix.release_target }}"
-          ) {
-            Write-Host "Skipping ${{ matrix.release_target }}"
-            exit 0
-          }
-
-          Write-Host "Building ${{ matrix.release_target }}"
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -528,12 +584,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
-        with:
-          version: "v0.10.0"
-
-      - name: Configure S3 sccache
+      - name: Configure S3 sccache backend
         if: env.SCCACHE_GHA_ENABLED != 'true'
         shell: bash
         env:
@@ -543,7 +594,6 @@ jobs:
           CACHE_KEY_PREFIX: ${{ secrets.SCCACHE_S3_KEY_PREFIX }}
           CACHE_ACCESS_KEY_ID: ${{ secrets.SCCACHE_S3_ACCESS_KEY_ID }}
           CACHE_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_S3_SECRET_ACCESS_KEY }}
-
         run: |
           {
             echo "SCCACHE_BUCKET=${CACHE_BUCKET}"
@@ -553,8 +603,19 @@ jobs:
             echo "SCCACHE_S3_USE_SSL=true"
             echo "AWS_ACCESS_KEY_ID=${CACHE_ACCESS_KEY_ID}"
             echo "AWS_SECRET_ACCESS_KEY=${CACHE_SECRET_ACCESS_KEY}"
-            echo "SCCACHE_IDLE_TIMEOUT=0"
           } >> "$GITHUB_ENV"
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        with:
+          version: "v0.10.0"
+
+      - name: Start and verify sccache server
+        shell: bash
+        run: |
+          set -e
+          sccache --start-server
+          sccache --show-stats
 
       - name: Compute Rust dependency hash
         id: deps-hash
@@ -851,25 +912,16 @@ jobs:
     strategy:
       fail-fast: false
 
-      matrix:
-        include:
-          - platform: ubuntu-22.04
-            target: x86_64-unknown-linux-musl
-            arch: x64
-            release_target: static-browser-x64
-            rustflags: "-C target-feature=+crt-static"
-
-          - platform: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-musl
-            arch: arm64
-            release_target: static-browser-arm64
-            rustflags: "-C target-feature=+crt-static -C link-arg=-z -C link-arg=max-page-size=65536"
+      matrix: ${{ fromJSON(needs.prepare.outputs.static_matrix) }}
 
     runs-on: ${{ matrix.platform }}
 
     env:
       CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
       RUSTC_WRAPPER: sccache
+      SCCACHE_IDLE_TIMEOUT: "0"
+      SCCACHE_LOG: "warn"
       SCCACHE_GHA_ENABLED: ${{ secrets.SCCACHE_S3_BUCKET == '' && 'true' || 'false' }}
       SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
       RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
@@ -899,12 +951,7 @@ jobs:
       - name: Install cargo-zigbuild
         run: pip3 install cargo-zigbuild
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
-        with:
-          version: "v0.10.0"
-
-      - name: Configure S3 sccache
+      - name: Configure S3 sccache backend
         if: env.SCCACHE_GHA_ENABLED != 'true'
         shell: bash
         env:
@@ -914,7 +961,6 @@ jobs:
           CACHE_KEY_PREFIX: ${{ secrets.SCCACHE_S3_KEY_PREFIX }}
           CACHE_ACCESS_KEY_ID: ${{ secrets.SCCACHE_S3_ACCESS_KEY_ID }}
           CACHE_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_S3_SECRET_ACCESS_KEY }}
-
         run: |
           {
             echo "SCCACHE_BUCKET=${CACHE_BUCKET}"
@@ -924,10 +970,21 @@ jobs:
             echo "SCCACHE_S3_USE_SSL=true"
             echo "AWS_ACCESS_KEY_ID=${CACHE_ACCESS_KEY_ID}"
             echo "AWS_SECRET_ACCESS_KEY=${CACHE_SECRET_ACCESS_KEY}"
-            echo "SCCACHE_IDLE_TIMEOUT=0"
-            echo "CC=${SCCACHE_PATH} cc"
-            echo "CXX=${SCCACHE_PATH} c++"
           } >> "$GITHUB_ENV"
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        with:
+          version: "v0.10.0"
+
+      - name: Start and verify sccache server
+        shell: bash
+        run: |
+          set -e
+          sccache --start-server
+          sccache --show-stats
+          echo "CC=${SCCACHE_PATH} cc" >> "$GITHUB_ENV"
+          echo "CXX=${SCCACHE_PATH} c++" >> "$GITHUB_ENV"
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
@@ -1394,216 +1451,72 @@ jobs:
 
 
   # ============================================================
-  # 10. 发布
+  # 10. Finalize release
   #
-  # 这里最重要。
+  # 增量发版期间 Release 始终保持 draft。
   #
-  # 不再要求所有平台都成功。
+  # 最后一遍手动选择 target=finalize：
+  #   1. 检查当前 Release
+  #   2. 列出当前所有 Asset
+  #   3. 发布 GitHub Release
+  #   4. 同步全部 Asset 到 CNB
   #
-  # 根据 inputs.target 判断：
-  #
-  # macos-arm64
-  #     -> 只要求 build 成功
-  #
-  # windows-x64
-  #     -> 只要求 build-windows 成功
-  #
-  # windows7-x64
-  #     -> 只要求 build-windows-7-offline 成功
-  #
-  # static-browser-x64/arm64
-  #     -> 只要求 static-browser 成功
-  #
-  # docker
-  #     -> 要求 docker-manifest 成功
-  #
-  # jdbc
-  #     -> 要求 jdbc-plugin 成功
-  #
-  # all
-  #     -> 所有正式发布组件成功
-  #
-  # 注意：Nix 是 advisory，所以不阻塞 all。
+  # 这样不会出现“第一次补发 Mac 就把 Release 提前发布”的问题。
   # ============================================================
-  publish:
-    name: Publish release
+  finalize:
+    name: Finalize release
 
-    if: >
-      always() &&
-      (
-        (
-          inputs.target == 'all' &&
-          needs.prepare.result == 'success' &&
-          needs.build.result == 'success' &&
-          needs.build-windows.result == 'success' &&
-          needs.build-windows-7-offline.result == 'success' &&
-          needs.static-browser.result == 'success' &&
-          needs.docker.result == 'success' &&
-          needs.docker-manifest.result == 'success' &&
-          needs.jdbc-plugin.result == 'success' &&
-          (
-            needs.cleanup-release-signatures.result == 'success' ||
-            needs.cleanup-release-signatures.result == 'skipped'
-          )
-        )
+    if: inputs.target == 'finalize'
 
-        ||
-
-        (
-          (
-            inputs.target == 'macos-arm64' ||
-            inputs.target == 'macos-x64' ||
-            inputs.target == 'linux-x64' ||
-            inputs.target == 'linux-arm64'
-          ) &&
-          needs.prepare.result == 'success' &&
-          needs.build.result == 'success' &&
-          (
-            needs.cleanup-release-signatures.result == 'success' ||
-            needs.cleanup-release-signatures.result == 'skipped'
-          )
-        )
-
-        ||
-
-        (
-          (
-            inputs.target == 'windows-x64' ||
-            inputs.target == 'windows-arm64'
-          ) &&
-          needs.prepare.result == 'success' &&
-          needs.build-windows.result == 'success' &&
-          (
-            needs.cleanup-release-signatures.result == 'success' ||
-            needs.cleanup-release-signatures.result == 'skipped'
-          )
-        )
-
-        ||
-
-        (
-          inputs.target == 'windows7-x64' &&
-          needs.prepare.result == 'success' &&
-          needs.build-windows-7-offline.result == 'success' &&
-          (
-            needs.cleanup-release-signatures.result == 'success' ||
-            needs.cleanup-release-signatures.result == 'skipped'
-          )
-        )
-
-        ||
-
-        (
-          (
-            inputs.target == 'static-browser-x64' ||
-            inputs.target == 'static-browser-arm64'
-          ) &&
-          needs.prepare.result == 'success' &&
-          needs.static-browser.result == 'success'
-        )
-
-        ||
-
-        (
-          inputs.target == 'docker' &&
-          needs.prepare.result == 'success' &&
-          needs.docker.result == 'success' &&
-          needs.docker-manifest.result == 'success'
-        )
-
-        ||
-
-        (
-          inputs.target == 'jdbc' &&
-          needs.prepare.result == 'success' &&
-          needs.bump-jdbc-plugin-version.result == 'success' &&
-          needs.jdbc-plugin.result == 'success'
-        )
-      )
-
-    needs:
-      - prepare
-      - build
-      - build-windows
-      - build-windows-7-offline
-      - static-browser
-      - docker
-      - docker-manifest
-      - bump-jdbc-plugin-version
-      - jdbc-plugin
-      - cleanup-release-signatures
-
+    needs: prepare
     runs-on: ubuntu-latest
 
     env:
       RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
 
     steps:
-      - name: Show release information
-        shell: bash
-        run: |
-          echo "========================================"
-          echo "Release"
-          echo "========================================"
-          echo "Tag:    $RELEASE_TAG"
-          echo "Target: ${{ inputs.target }}"
-          echo "========================================"
-
-      - name: Publish draft release
+      - name: Verify release exists and is draft
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
+        shell: bash
         run: |
+          set -euo pipefail
+
+          gh release view "$RELEASE_TAG" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --json tagName,isDraft,isPrerelease,assets \
+            > "$RUNNER_TEMP/release.json"
+
+          if [ "$(jq -r '.isDraft' "$RUNNER_TEMP/release.json")" != "true" ]; then
+            echo "::error::Release $RELEASE_TAG is already published. Nothing to finalize."
+            exit 1
+          fi
+
+          echo "Release: $RELEASE_TAG"
+          echo "Current assets:"
+          jq -r '.assets[].name' "$RUNNER_TEMP/release.json" | sort || true
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
           gh release edit "$RELEASE_TAG" \
-            --repo "${{ github.repository }}" \
+            --repo "${GITHUB_REPOSITORY}" \
             --draft=false \
-            --prerelease
+            --prerelease=false
 
-
-  # ============================================================
-  # 11. 同步到 CNB
-  #
-  # 每次增量发版成功后：
-  #
-  # GitHub Release
-  #       ↓
-  # 下载当前 Release 全部 Asset
-  #       ↓
-  # 同步 CNB
-  #
-  # 因此第二次补发 Windows 时，
-  # CNB 最终也会包含第一次的 Mac + 第二次的 Windows。
-  # ============================================================
-  sync-release-to-cnb:
-    name: Sync release to CNB
-
-    if: >
-      always() &&
-      needs.publish.result == 'success'
-
-    needs:
-      - prepare
-      - publish
-
-    runs-on: ubuntu-latest
-    continue-on-error: true
-
-    env:
-      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
-
-    steps:
       - name: Checkout repository
         uses: actions/checkout@v5
-
         with:
           ref: ${{ needs.prepare.outputs.tag }}
 
       - name: Download GitHub release assets
         env:
-          TAG_NAME: ${{ needs.prepare.outputs.tag }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -1611,13 +1524,13 @@ jobs:
             "$RUNNER_TEMP/github-release" \
             "$RUNNER_TEMP/release-assets"
 
-          gh release view "$TAG_NAME" \
-            --repo "$GITHUB_REPOSITORY" \
+          gh release view "$RELEASE_TAG" \
+            --repo "${GITHUB_REPOSITORY}" \
             --json tagName,name,body,targetCommitish,isPrerelease,isDraft,assets \
             > "$RUNNER_TEMP/github-release/release.json"
 
-          gh release download "$TAG_NAME" \
-            --repo "$GITHUB_REPOSITORY" \
+          gh release download "$RELEASE_TAG" \
+            --repo "${GITHUB_REPOSITORY}" \
             --dir "$RUNNER_TEMP/release-assets" \
             --clobber
 
@@ -1625,7 +1538,7 @@ jobs:
         env:
           CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
           CNB_UPLOAD_CONCURRENCY: "3"
-
+        continue-on-error: true
         run: |
           node .github/scripts/sync-cnb-release.mjs \
             --github-release "$RUNNER_TEMP/github-release/release.json" \
@@ -1633,11 +1546,9 @@ jobs:
 
       - name: Keep latest five app releases in CNB
         continue-on-error: true
-
         env:
           CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
           CURRENT_TAG: ${{ needs.prepare.outputs.tag }}
-
         run: |
           node .github/scripts/cleanup-cnb-releases.mjs \
             --current-tag "$CURRENT_TAG" \
