@@ -47,7 +47,7 @@ export type PluginCatalog = {
 // Same source the in-app plugin center consumes (R2 primary, GitHub raw fallback);
 // R2 responds with a dbxio.com CORS header, so the browser refresh path works too.
 export const PLUGIN_CATALOG_URLS = [
-  "https://dl.dbxio.com/catalog/index.json",
+  // "https://dl.dbxio.com/catalog/index.json",
   "https://raw.githubusercontent.com/t8y2/dbx-store/main/catalog/index.json",
 ] as const;
 
