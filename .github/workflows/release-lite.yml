@@ -4,51 +4,54 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, must start with 'lite-v', e.g. lite-v1.2.3"
+        description: "Release tag, e.g. v0.6.15 or lite-v0.6.15"
         required: true
         type: string
+      sign:
+        description: "Sign Windows / macOS artifacts (requires signing secrets & vars). Leave OFF for local use."
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
-env:
-  RELEASE_TAG: ${{ inputs.tag }}
-
 jobs:
   # ============================================================
-  # 1. 准备 draft release（若 tag 不存在则基于当前 commit 创建）
+  # 1. 规范化 tag + 创建 draft release
   # ============================================================
   prepare-release:
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.norm.outputs.tag }}
+      version: ${{ steps.norm.outputs.version }}
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
-      - name: Compute version
-        id: ver
+      - name: Normalize input tag
+        id: norm
         shell: bash
         run: |
-          TAG="${{ inputs.tag }}"
-          case "$TAG" in
-            lite-v*) ;;
-            *) echo "::error::Tag must start with 'lite-v' (got: $TAG)"; exit 1 ;;
-          esac
-          VERSION="${TAG#lite-v}"
-          if [ -z "$VERSION" ]; then
-            echo "::error::Empty version after stripping 'lite-v'"; exit 1
+          RAW="${{ inputs.tag }}"
+          RAW="${RAW#refs/tags/}"
+          RAW="${RAW#lite-v}"
+          RAW="${RAW#v}"
+          if ! [[ "$RAW" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid version '$RAW' (expected e.g. 0.6.15, v0.6.15 or lite-v0.6.15)"
+            exit 1
           fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Release tag: $TAG (version: $VERSION)"
+          echo "tag=lite-v${RAW}"   >> "$GITHUB_OUTPUT"
+          echo "version=${RAW}"     >> "$GITHUB_OUTPUT"
+          echo "Normalized: lite-v${RAW} (version ${RAW})"
 
       - name: Create tag + draft release if missing
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
-          TAG="${{ inputs.tag }}"
+          TAG="${{ steps.norm.outputs.tag }}"
           REPO="${{ github.repository }}"
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             echo "Draft release for $TAG already exists."
@@ -81,10 +84,11 @@ jobs:
       CARGO_INCREMENTAL: "0"
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: ${{ secrets.SCCACHE_S3_BUCKET == '' && 'true' || 'false' }}
+      RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ needs.prepare-release.outputs.tag }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -163,6 +167,7 @@ jobs:
           cache-on-failure: true
 
       - name: Install Apple certificate (macOS)
+        if: ${{ inputs.sign }}
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -191,12 +196,14 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # When sign=true use the real identity; otherwise use ad-hoc "-" so
+          # the DMG can still be produced without a Developer ID certificate.
+          APPLE_SIGNING_IDENTITY: ${{ inputs.sign && secrets.APPLE_SIGNING_IDENTITY || '-' }}
+          APPLE_ID: ${{ inputs.sign && secrets.APPLE_ID || '' }}
+          APPLE_PASSWORD: ${{ inputs.sign && secrets.APPLE_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ inputs.sign && secrets.APPLE_TEAM_ID || '' }}
         with:
-          tagName: ${{ inputs.tag }}
+          tagName: ${{ needs.prepare-release.outputs.tag }}
           releaseDraft: true
           assetNamePattern: ${{ matrix.asset_pattern }}
           args: --target ${{ matrix.target }}
@@ -231,10 +238,13 @@ jobs:
       VSIGN_OPERATOR_SHA1: ${{ vars.VSIGN_OPERATOR_SHA1 }}
       VSIGN_SERVER: ${{ vars.VSIGN_SERVER }}
       VSIGN_TOOL_SHA256: ${{ vars.VSIGN_TOOL_SHA256 }}
+      RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.prepare-release.outputs.version }}
+      DO_SIGN: ${{ inputs.sign && 'true' || 'false' }}
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ needs.prepare-release.outputs.tag }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -313,11 +323,16 @@ jobs:
           fi
 
       - name: Setup TrustAsia VSign
+        if: env.DO_SIGN == 'true'
         shell: pwsh
         env:
           VSIGN_OPERATOR_PFX_B64: ${{ secrets.VSIGN_OPERATOR_PFX_B64 }}
           VSIGN_OPERATOR_PWD: ${{ secrets.VSIGN_OPERATOR_PWD }}
         run: ./.github/scripts/setup-vsign.ps1
+
+      - name: Build frontend and Windows executable
+        shell: pwsh
+        run: pnpm tauri build --target ${{ matrix.target }} --no-bundle
 
       - name: Build and upload WebView2 offline installer
         shell: pwsh
@@ -326,7 +341,7 @@ jobs:
           SSIGNCODE_OPERATOR_PWD: ${{ secrets.VSIGN_OPERATOR_PWD }}
           VSIGN_KEY_PIN: ${{ secrets.VSIGN_KEY_PIN }}
         run: |
-          $version = "${{ inputs.tag }}" -replace '^lite-v', ''
+          $version = $env:RELEASE_VERSION
           $arch = "${{ matrix.arch }}"
           $bundleDir = "target/${{ matrix.target }}/release/bundle/nsis"
           $offlineName = "DBX_${version}_${arch}-offline-setup.exe"
@@ -336,9 +351,14 @@ jobs:
             Get-ChildItem $bundleDir -Filter "*.exe" | ForEach-Object { $before[$_.FullName] = $_.LastWriteTimeUtc }
           }
 
-          pnpm tauri bundle --bundles nsis --target ${{ matrix.target }} `
-            --config src-tauri/tauri.webview2-offline.conf.json `
-            --config src-tauri/tauri.vsign.conf.json
+          if ($env:DO_SIGN -eq "true") {
+            pnpm tauri bundle --bundles nsis --target ${{ matrix.target }} `
+              --config src-tauri/tauri.webview2-offline.conf.json `
+              --config src-tauri/tauri.vsign.conf.json
+          } else {
+            pnpm tauri bundle --bundles nsis --target ${{ matrix.target }} `
+              --config src-tauri/tauri.webview2-offline.conf.json
+          }
 
           $installer = Get-ChildItem $bundleDir -Filter "*.exe" |
             Where-Object { !$before.ContainsKey($_.FullName) -or $_.LastWriteTimeUtc -gt $before[$_.FullName] } |
@@ -349,7 +369,10 @@ jobs:
             throw "Missing WebView2 offline installer in ${bundleDir}"
           }
 
-          ./.github/scripts/assert-authenticode.ps1 -Path $installer.FullName
+          if ($env:DO_SIGN -eq "true") {
+            ./.github/scripts/assert-authenticode.ps1 -Path $installer.FullName
+          }
+
           Copy-Item $installer.FullName $offlineName -Force
           gh release upload "${env:RELEASE_TAG}" $offlineName `
             --repo "${env:GITHUB_REPOSITORY}" --clobber
@@ -388,10 +411,13 @@ jobs:
       VSIGN_OPERATOR_SHA1: ${{ vars.VSIGN_OPERATOR_SHA1 }}
       VSIGN_SERVER: ${{ vars.VSIGN_SERVER }}
       VSIGN_TOOL_SHA256: ${{ vars.VSIGN_TOOL_SHA256 }}
+      RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.prepare-release.outputs.version }}
+      DO_SIGN: ${{ inputs.sign && 'true' || 'false' }}
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ needs.prepare-release.outputs.tag }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -449,6 +475,7 @@ jobs:
         run: ./.github/scripts/assert-webview2-win7-loader.ps1 -BinaryPath target/x86_64-win7-windows-msvc/release/dbx.exe
 
       - name: Setup TrustAsia VSign
+        if: env.DO_SIGN == 'true'
         shell: pwsh
         env:
           VSIGN_OPERATOR_PFX_B64: ${{ secrets.VSIGN_OPERATOR_PFX_B64 }}
@@ -462,7 +489,7 @@ jobs:
           SSIGNCODE_OPERATOR_PWD: ${{ secrets.VSIGN_OPERATOR_PWD }}
           VSIGN_KEY_PIN: ${{ secrets.VSIGN_KEY_PIN }}
         run: |
-          $version = "${{ inputs.tag }}" -replace '^lite-v', ''
+          $version = $env:RELEASE_VERSION
           $bundleDir = "target/x86_64-win7-windows-msvc/release/bundle/nsis"
           $offlineName = "DBX_${version}_x64-win7-server2012r2-offline-setup.exe"
           $checksumName = "${offlineName}.sha256"
@@ -474,9 +501,14 @@ jobs:
             exit 1
           }
 
-          pnpm tauri bundle --bundles nsis --target x86_64-win7-windows-msvc `
-            --config src-tauri/tauri.webview2-win7-fixed.conf.json `
-            --config src-tauri/tauri.vsign.conf.json
+          if ($env:DO_SIGN -eq "true") {
+            pnpm tauri bundle --bundles nsis --target x86_64-win7-windows-msvc `
+              --config src-tauri/tauri.webview2-win7-fixed.conf.json `
+              --config src-tauri/tauri.vsign.conf.json
+          } else {
+            pnpm tauri bundle --bundles nsis --target x86_64-win7-windows-msvc `
+              --config src-tauri/tauri.webview2-win7-fixed.conf.json
+          }
 
           $installer = Get-ChildItem $bundleDir -Filter "*.exe" |
             Sort-Object LastWriteTimeUtc -Descending |
@@ -487,7 +519,9 @@ jobs:
           }
 
           ./.github/scripts/assert-win7-installer-content.ps1 -InstallerPath $installer.FullName
-          ./.github/scripts/assert-authenticode.ps1 -Path $installer.FullName
+          if ($env:DO_SIGN -eq "true") {
+            ./.github/scripts/assert-authenticode.ps1 -Path $installer.FullName
+          }
 
           Copy-Item $installer.FullName $offlineName -Force
           $hash = (Get-FileHash -LiteralPath $offlineName -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -512,13 +546,13 @@ jobs:
   # 5. 发布（把 draft 变成 prerelease）
   # ============================================================
   publish:
-    needs: [build-macos, build-windows-10-offline, build-windows-7-offline]
+    needs: [prepare-release, build-macos, build-windows-10-offline, build-windows-7-offline]
     runs-on: ubuntu-latest
     steps:
       - name: Publish draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release edit "${RELEASE_TAG}" \
+          gh release edit "${{ needs.prepare-release.outputs.tag }}" \
             --repo "${{ github.repository }}" \
             --draft=false --prerelease
