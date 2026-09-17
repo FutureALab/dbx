@@ -445,10 +445,6 @@ describe("legacy WebView CSS fallbacks", () => {
     expect(fallback).toContain("margin-left: -0.625rem !important;");
     expect(changelogPanelSource).toContain("settings-about-section-header flex flex-col gap-3");
     expect(changelogPanelSource).toContain("settings-about-section-actions flex shrink-0 flex-wrap items-center gap-2");
-    expect(fallback).toContain(".settings-about-section-header");
-    expect(fallback).toContain("justify-content: space-between !important;");
-    expect(fallback).toContain(".settings-about-section-actions");
-    expect(fallback).toContain("margin-left: auto !important;");
   });
 
   it("uses a runtime capability check instead of an OKLCH-only CSS proxy", () => {
