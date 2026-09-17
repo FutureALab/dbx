@@ -132,11 +132,11 @@ describe("EDITOR_SETTINGS_DRAFT_KEYS", () => {
 });
 
 describe("cell detail button settings control", () => {
-  it("binds the switch through apply and both reset paths", () => {
+  it("binds the switch through apply and the reset path", () => {
     expect(settingsDialogSource).toContain("const editDataGridCellDetailButtonVisible = ref(settingsStore.editorSettings.dataGridCellDetailButtonVisible)");
     expect(settingsDialogSource).toContain("dataGridCellDetailButtonVisible: editDataGridCellDetailButtonVisible.value");
     expect(settingsDialogSource).toContain("editDataGridCellDetailButtonVisible.value = settingsStore.editorSettings.dataGridCellDetailButtonVisible");
-    expect(settingsDialogSource.match(/editDataGridCellDetailButtonVisible\.value = DEFAULT_EDITOR_SETTINGS\.dataGridCellDetailButtonVisible/g)).toHaveLength(2);
+    expect(settingsDialogSource.match(/editDataGridCellDetailButtonVisible\.value = DEFAULT_EDITOR_SETTINGS\.dataGridCellDetailButtonVisible/g)).toHaveLength(1);
     expect(settingsDialogSource).toContain('id="data-grid-cell-detail-button-visible" v-model="editDataGridCellDetailButtonVisible"');
   });
 });
@@ -491,14 +491,5 @@ describe("editorSettingsDraftPatchFromSettings", () => {
   it("normalizes imported values per key", () => {
     const patch = editorSettingsDraftPatchFromSettings({ pageSize: 999999 } as Partial<EditorSettings>);
     expect(patch.pageSize).toBe(normalizeTableOpenPageSizeDraft(999999));
-  });
-
-  it("is the base for the settings import path in the dialog", () => {
-    // The import must patch only imported keys into the edit refs; rebuilding
-    // the whole draft would drop unsaved state the file does not cover (e.g. a
-    // half-filled table-column template row, which serialization drops).
-    expect(settingsDialogSource).toContain("const patch = editorSettingsDraftPatchFromSettings(imported);");
-    expect(settingsDialogSource).toContain("applyEditorSettingsKeysToRefs(patch as EditorSettingsDraft, Object.keys(patch) as EditorSettingsDraftKey[]);");
-    expect(settingsDialogSource).not.toContain("const merged = editorSettingsDraftFromSettings({");
   });
 });

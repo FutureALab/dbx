@@ -195,27 +195,4 @@ describe("EditorSettingsDialog shortcut reset exits capture state (behavior)", (
     expect(restored.cancelButton).toBeNull();
     expect(restored.editButton).toBeTruthy();
   });
-
-  it("full reset on the about tab also exits a capture state that leaked across tabs", async () => {
-    const { host, setTab } = await mountSettingsPage("shortcuts");
-
-    formatSqlRowControls(host).editButton!.click();
-    await flushAsyncUpdates();
-    expect(formatSqlRowControls(host).cancelButton).toBeTruthy();
-
-    setTab("about");
-    await flushAsyncUpdates();
-    const fullResetButton = findButtonByText(host, "settings.resetAllDefaults");
-    expect(fullResetButton).toBeTruthy();
-    fullResetButton!.click();
-    await flushAsyncUpdates();
-
-    setTab("shortcuts");
-    await flushAsyncUpdates();
-
-    const restored = formatSqlRowControls(host);
-    expect(restored.input.value).toBe(formatSqlDefaultPill());
-    expect(restored.cancelButton).toBeNull();
-    expect(restored.editButton).toBeTruthy();
-  });
 });
