@@ -1,4 +1,4 @@
-name: Release
+name: Release-One
 
 on:
   workflow_dispatch:
@@ -7,6 +7,26 @@ on:
         description: "Release tag (must start with v, e.g. v0.6.15)"
         required: true
         type: string
+
+      target:
+        description: "Select release target. Run the same tag multiple times to add more platforms."
+        required: true
+        type: choice
+        default: all
+        options:
+          - all
+          - macos-arm64
+          - macos-x64
+          - linux-x64
+          - linux-arm64
+          - windows-x64
+          - windows-arm64
+          - windows7-x64
+          - static-browser-x64
+          - static-browser-arm64
+          - docker
+          - jdbc
+
       sign:
         description: "Enable code signing (requires secrets/vars). Leave OFF for local use."
         required: false
@@ -16,6 +36,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
 env:
   CNB_REPOSITORY: "dbxio.com/dbx"
   CNB_USERNAME: "cnb"
@@ -24,13 +48,28 @@ env:
 jobs:
   # ============================================================
   # 0. 准备 draft release
+  #
+  # 同一个 tag 可以重复执行：
+  #
+  # Run 1:
+  #   v0.6.15 + macos-arm64
+  #
+  # Run 2:
+  #   v0.6.15 + windows-x64
+  #
+  # Run 3:
+  #   v0.6.15 + docker
+  #
+  # 所有 Asset 最终都会进入同一个 Release。
   # ============================================================
   prepare:
     name: Prepare release
     runs-on: ubuntu-latest
+
     outputs:
       tag: ${{ steps.norm.outputs.tag }}
       version: ${{ steps.norm.outputs.version }}
+
     steps:
       - uses: actions/checkout@v5
         with:
@@ -42,13 +81,18 @@ jobs:
         run: |
           TAG="${{ inputs.tag }}"
           VERSION="${TAG#v}"
+
           if [ -z "$TAG" ] || [ "$VERSION" = "$TAG" ]; then
             echo "::error::Tag must start with 'v' (got: $TAG)"
             exit 1
           fi
-          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Release tag: $TAG (version: $VERSION)"
+
+          echo "Release tag: $TAG"
+          echo "Release version: $VERSION"
+          echo "Release target: ${{ inputs.target }}"
 
       - name: Create draft release if missing
         env:
@@ -56,10 +100,12 @@ jobs:
         shell: bash
         run: |
           TAG="${{ steps.norm.outputs.tag }}"
+
           if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             echo "Release $TAG already exists, using it."
           else
             echo "Creating draft release $TAG on $(git rev-parse HEAD)"
+
             gh release create "$TAG" \
               --repo "${{ github.repository }}" \
               --draft \
@@ -67,13 +113,21 @@ jobs:
               --target "$(git rev-parse HEAD)"
           fi
 
+
   # ============================================================
-  # 1. Nix 打包（advisory）
+  # 1. Nix 打包
+  #
+  # 原逻辑保持不变。
+  #
+  # Nix 本身是 advisory，不作为正式 release target。
+  # 只有 target=all 时执行。
   # ============================================================
   nix-packaging:
+    if: inputs.target == 'all'
     needs: prepare
     runs-on: ubuntu-22.04
     continue-on-error: true
+
     steps:
       - uses: actions/checkout@v5
         with:
@@ -85,17 +139,27 @@ jobs:
       - name: Build Nix desktop package
         run: nix build .#dbx-desktop --no-link --print-build-logs
 
+
   # ============================================================
   # 2. JDBC 插件版本 bump
+  #
+  # 只有：
+  #   target=all
+  #   target=jdbc
+  #
+  # 才执行。
   # ============================================================
   bump-jdbc-plugin-version:
+    if: inputs.target == 'all' || inputs.target == 'jdbc'
     needs: prepare
     runs-on: ubuntu-latest
+
     outputs:
       changed: ${{ steps.bump.outputs.changed }}
       old_version: ${{ steps.bump.outputs.old_version }}
       new_version: ${{ steps.bump.outputs.new_version }}
       prev_tag: ${{ steps.prev-tag.outputs.prev_tag }}
+
     steps:
       - uses: actions/checkout@v5
         with:
@@ -108,9 +172,11 @@ jobs:
         shell: bash
         run: |
           PREV_TAG=$(git tag --sort=-creatordate | grep '^v' | sed -n '2p')
+
           if [ -z "$PREV_TAG" ]; then
             PREV_TAG=$(git rev-list --max-parents=0 HEAD)
           fi
+
           echo "prev_tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
           echo "Comparing ${PREV_TAG}..HEAD"
 
@@ -118,7 +184,13 @@ jobs:
         id: bump
         shell: bash
         run: |
-          BUMP_OUTPUT="$(node .github/scripts/bump-jdbc-plugin-version.mjs "${{ steps.prev-tag.outputs.prev_tag }}" HEAD --write)"
+          BUMP_OUTPUT="$(
+            node .github/scripts/bump-jdbc-plugin-version.mjs \
+              "${{ steps.prev-tag.outputs.prev_tag }}" \
+              HEAD \
+              --write
+          )"
+
           echo "$BUMP_OUTPUT"
           echo "$BUMP_OUTPUT" >> "$GITHUB_OUTPUT"
 
@@ -127,66 +199,117 @@ jobs:
         shell: bash
         run: |
           TMP_DIR="$(mktemp -d)"
+
           cp plugins/jdbc/build.gradle "$TMP_DIR/build.gradle"
           cp plugins/jdbc/manifest.json "$TMP_DIR/manifest.json"
+
           git restore plugins/jdbc/build.gradle plugins/jdbc/manifest.json
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
           git fetch origin main
           git switch -C jdbc-plugin-version-bump origin/main
+
           cp "$TMP_DIR/build.gradle" plugins/jdbc/build.gradle
           cp "$TMP_DIR/manifest.json" plugins/jdbc/manifest.json
+
           git add plugins/jdbc/build.gradle plugins/jdbc/manifest.json
+
           if git diff --cached --quiet; then
             echo "JDBC plugin version ${{ steps.bump.outputs.new_version }} is already on main."
             exit 0
           fi
+
           git commit -m "chore(jdbc): bump plugin version [skip ci]"
+
           for attempt in 1 2 3; do
             if git push origin HEAD:main; then
               exit 0
             fi
+
             if [ "$attempt" -eq 3 ]; then
               echo "::error::Unable to push JDBC plugin version bump after ${attempt} attempts."
               exit 1
             fi
+
             git fetch origin main --no-tags
             git rebase origin/main
           done
 
+
   # ============================================================
-  # 3. Linux + macOS 构建（deb / rpm / AppImage / dmg）
+  # 3. Linux + macOS 构建
+  #
+  # matrix 保留四个平台。
+  #
+  # 通过 job-level if 只执行用户选择的 target。
+  #
+  # target=all:
+  #   四个平台全部执行
+  #
+  # target=macos-arm64:
+  #   只有 ARM64 macOS 执行
   # ============================================================
   build:
     name: build (${{ matrix.platform }}, ${{ matrix.target }})
+
+    if: >
+      inputs.target == 'all' ||
+      inputs.target == 'macos-arm64' ||
+      inputs.target == 'macos-x64' ||
+      inputs.target == 'linux-x64' ||
+      inputs.target == 'linux-arm64'
+
     needs: prepare
+
     strategy:
       fail-fast: false
+
       matrix:
         include:
           - platform: macos-latest
             target: aarch64-apple-darwin
+            release_target: macos-arm64
             asset_pattern: "DBX_[version]_arm64[setup][ext]"
+
           - platform: macos-15-intel
             target: x86_64-apple-darwin
+            release_target: macos-x64
+
           - platform: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+            release_target: linux-x64
+
           - platform: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
+            release_target: linux-arm64
             asset_pattern: "DBX_[version]_arm64[setup][ext]"
 
     runs-on: ${{ matrix.platform }}
+
     env:
       CARGO_INCREMENTAL: "0"
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: ${{ secrets.SCCACHE_S3_BUCKET == '' && 'true' || 'false' }}
       SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
       RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+
     steps:
       - uses: actions/checkout@v5
         with:
           ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Check selected target
+        shell: bash
+        run: |
+          if [ "${{ inputs.target }}" != "all" ] && \
+             [ "${{ inputs.target }}" != "${{ matrix.release_target }}" ]; then
+            echo "Skipping ${{ matrix.release_target }}"
+            exit 0
+          fi
+
+          echo "Building ${{ matrix.release_target }}"
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -219,6 +342,7 @@ jobs:
           CACHE_KEY_PREFIX: ${{ secrets.SCCACHE_S3_KEY_PREFIX }}
           CACHE_ACCESS_KEY_ID: ${{ secrets.SCCACHE_S3_ACCESS_KEY_ID }}
           CACHE_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_S3_SECRET_ACCESS_KEY }}
+
         run: |
           {
             echo "SCCACHE_BUCKET=${CACHE_BUCKET}"
@@ -229,6 +353,7 @@ jobs:
             echo "AWS_ACCESS_KEY_ID=${CACHE_ACCESS_KEY_ID}"
             echo "AWS_SECRET_ACCESS_KEY=${CACHE_SECRET_ACCESS_KEY}"
             echo "SCCACHE_IDLE_TIMEOUT=0"
+
             case "${RUNNER_OS}" in
               Linux)
                 echo "CC=${SCCACHE_PATH} cc"
@@ -249,7 +374,9 @@ jobs:
             find . -name Cargo.toml -not -path './target/*' -print0 \
               | sort -z \
               | xargs -0 sed -E '/^version = /d'
+
             grep -v '^version = ' Cargo.lock
+
           } | sha256sum | cut -d' ' -f1 | {
             read -r hash
             echo "hash=${hash:0:20}" >> "$GITHUB_OUTPUT"
@@ -268,16 +395,30 @@ jobs:
         if: startsWith(matrix.platform, 'ubuntu')
         run: |
           sudo apt-get update
-          # rpm is required so Tauri produces .rpm bundles
-          sudo apt-get install -y fcitx5-frontend-gtk3 ibus-gtk3 libwebkit2gtk-4.1-dev libgtk-3-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev xdg-utils rpm
+
+          sudo apt-get install -y \
+            fcitx5-frontend-gtk3 \
+            ibus-gtk3 \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev \
+            xdg-utils \
+            rpm
 
       - name: Setup Tauri signing key (optional)
         shell: bash
         run: |
           if [ -n "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_BASE64 }}" ]; then
-            echo "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_BASE64 }}" | base64 --decode > "$RUNNER_TEMP/updater.key"
+            echo "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_BASE64 }}" \
+              | base64 --decode > "$RUNNER_TEMP/updater.key"
+
             KEY_B64=$(base64 < "$RUNNER_TEMP/updater.key" | tr -d '\r\n')
+
             echo "TAURI_SIGNING_PRIVATE_KEY=$KEY_B64" >> "$GITHUB_ENV"
+
             if [ -n "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}" ]; then
               echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}" >> "$GITHUB_ENV"
             fi
@@ -285,8 +426,9 @@ jobs:
             echo "No TAURI_SIGNING_PRIVATE_KEY_BASE64; skipping updater key setup."
           fi
 
-      # 注意：这里不传任何 APPLE_* 环境变量。Tauri 会走默认 ad-hoc 签名，
-      # 不会触发 notarize，因此不会出现 "Team ID must be at least 3 characters"。
+      # 注意：这里不传任何 APPLE_* 环境变量。
+      # Tauri 会走默认 ad-hoc 签名，
+      # 不会触发 notarize。
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
@@ -300,7 +442,9 @@ jobs:
       - name: Verify AppImage input methods
         if: startsWith(matrix.platform, 'ubuntu')
         shell: bash
-        run: ./.github/scripts/verify-appimage-input-methods.sh "target/${{ matrix.target }}/release/bundle/appimage"
+        run: |
+          ./.github/scripts/verify-appimage-input-methods.sh \
+            "target/${{ matrix.target }}/release/bundle/appimage"
 
       - name: Show sccache stats
         if: always()
@@ -308,20 +452,40 @@ jobs:
         shell: bash
         run: ${SCCACHE_PATH} --show-stats
 
+
   # ============================================================
-  # 4. Windows 10/11 offline 安装包（x64 + arm64）
+  # 4. Windows 10/11 offline 安装包
+  #
+  # target:
+  #   windows-x64
+  #   windows-arm64
+  #   all
   # ============================================================
   build-windows:
+    name: build-windows (${{ matrix.arch }})
+
+    if: >
+      inputs.target == 'all' ||
+      inputs.target == 'windows-x64' ||
+      inputs.target == 'windows-arm64'
+
     needs: prepare
+
     strategy:
       fail-fast: false
+
       matrix:
         include:
           - target: x86_64-pc-windows-msvc
             arch: x64
+            release_target: windows-x64
+
           - target: aarch64-pc-windows-msvc
             arch: arm64
+            release_target: windows-arm64
+
     runs-on: windows-2022
+
     env:
       CARGO_INCREMENTAL: "0"
       RUSTC_WRAPPER: sccache
@@ -329,10 +493,24 @@ jobs:
       SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
       RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
       RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+
     steps:
       - uses: actions/checkout@v5
         with:
           ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Check selected target
+        shell: pwsh
+        run: |
+          if (
+            "${{ inputs.target }}" -ne "all" -and
+            "${{ inputs.target }}" -ne "${{ matrix.release_target }}"
+          ) {
+            Write-Host "Skipping ${{ matrix.release_target }}"
+            exit 0
+          }
+
+          Write-Host "Building ${{ matrix.release_target }}"
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -365,6 +543,7 @@ jobs:
           CACHE_KEY_PREFIX: ${{ secrets.SCCACHE_S3_KEY_PREFIX }}
           CACHE_ACCESS_KEY_ID: ${{ secrets.SCCACHE_S3_ACCESS_KEY_ID }}
           CACHE_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_S3_SECRET_ACCESS_KEY }}
+
         run: |
           {
             echo "SCCACHE_BUCKET=${CACHE_BUCKET}"
@@ -385,7 +564,9 @@ jobs:
             find . -name Cargo.toml -not -path './target/*' -print0 \
               | sort -z \
               | xargs -0 sed -E '/^version = /d'
+
             grep -v '^version = ' Cargo.lock
+
           } | sha256sum | cut -d' ' -f1 | {
             read -r hash
             echo "hash=${hash:0:20}" >> "$GITHUB_OUTPUT"
@@ -404,9 +585,13 @@ jobs:
         shell: bash
         run: |
           if [ -n "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_BASE64 }}" ]; then
-            echo "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_BASE64 }}" | base64 --decode > "$RUNNER_TEMP/updater.key"
+            echo "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_BASE64 }}" \
+              | base64 --decode > "$RUNNER_TEMP/updater.key"
+
             KEY_B64=$(base64 < "$RUNNER_TEMP/updater.key" | tr -d '\r\n')
+
             echo "TAURI_SIGNING_PRIVATE_KEY=$KEY_B64" >> "$GITHUB_ENV"
+
             if [ -n "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}" ]; then
               echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}" >> "$GITHUB_ENV"
             fi
@@ -414,28 +599,42 @@ jobs:
 
       - name: Build frontend and Windows executable
         shell: pwsh
-        run: pnpm tauri build --target ${{ matrix.target }} --no-bundle
+        run: |
+          pnpm tauri build \
+            --target ${{ matrix.target }} \
+            --no-bundle
 
       - name: Build and upload WebView2 offline installer
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
         run: |
           $version = $env:RELEASE_VERSION
           $arch = "${{ matrix.arch }}"
+
           $bundleDir = "target/${{ matrix.target }}/release/bundle/nsis"
           $offlineName = "DBX_${version}_${arch}-offline-setup.exe"
+
           $before = @{}
 
           if (Test-Path $bundleDir) {
-            Get-ChildItem $bundleDir -Filter "*.exe" | ForEach-Object { $before[$_.FullName] = $_.LastWriteTimeUtc }
+            Get-ChildItem $bundleDir -Filter "*.exe" |
+              ForEach-Object {
+                $before[$_.FullName] = $_.LastWriteTimeUtc
+              }
           }
 
-          pnpm tauri bundle --bundles nsis --target ${{ matrix.target }} `
+          pnpm tauri bundle \
+            --bundles nsis \
+            --target ${{ matrix.target }} `
             --config src-tauri/tauri.webview2-offline.conf.json
 
           $installer = Get-ChildItem $bundleDir -Filter "*.exe" |
-            Where-Object { !$before.ContainsKey($_.FullName) -or $_.LastWriteTimeUtc -gt $before[$_.FullName] } |
+            Where-Object {
+              !$before.ContainsKey($_.FullName) -or
+              $_.LastWriteTimeUtc -gt $before[$_.FullName]
+            } |
             Sort-Object LastWriteTimeUtc -Descending |
             Select-Object -First 1
 
@@ -444,8 +643,11 @@ jobs:
           }
 
           Copy-Item $installer.FullName $offlineName -Force
-          gh release upload "${env:RELEASE_TAG}" $offlineName `
-            --repo "${env:GITHUB_REPOSITORY}" --clobber
+
+          gh release upload "${env:RELEASE_TAG}" `
+            $offlineName `
+            --repo "${env:GITHUB_REPOSITORY}" `
+            --clobber
 
       - name: Show sccache stats
         if: always()
@@ -453,17 +655,30 @@ jobs:
         shell: bash
         run: ${SCCACHE_PATH} --show-stats
 
+
   # ============================================================
-  # 5. Windows 7 / Server 2012 R2 offline（仅 x64）
+  # 5. Windows 7 / Server 2012 R2 offline
+  #
+  # 只有：
+  #   target=all
+  #   target=windows7-x64
+  #
+  # 执行。
   # ============================================================
   build-windows-7-offline:
+    name: build-windows-7-offline
+
+    if: inputs.target == 'all' || inputs.target == 'windows7-x64'
+
     needs: prepare
     runs-on: windows-2022
+
     env:
       CARGO_INCREMENTAL: "0"
       RUSTFLAGS: -C debuginfo=line-tables-only -C target-feature=+crt-static
       RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
       RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+
     steps:
       - uses: actions/checkout@v5
         with:
@@ -488,15 +703,18 @@ jobs:
 
       - name: Prepare Win7-compatible WebView2 loader
         shell: pwsh
-        run: ./.github/scripts/prepare-webview2-win7-loader.ps1
+        run: |
+          ./.github/scripts/prepare-webview2-win7-loader.ps1
 
       - name: Prepare WebView2 109 fixed runtime
         shell: pwsh
-        run: ./.github/scripts/prepare-webview2-win7-runtime.ps1
+        run: |
+          ./.github/scripts/prepare-webview2-win7-runtime.ps1
 
       - name: Probe WebView2 109 fixed runtime
         shell: pwsh
-        run: ./.github/scripts/assert-webview2-win7-runtime.ps1
+        run: |
+          ./.github/scripts/assert-webview2-win7-runtime.ps1
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
@@ -513,71 +731,142 @@ jobs:
       - name: Build DBX for Windows 7
         shell: pwsh
         run: |
-          $env:TAURI_CONFIG = Get-Content src-tauri/tauri.webview2-win7-fixed.conf.json -Raw
-          cargo build --locked --package dbx --release --features custom-protocol --target x86_64-win7-windows-msvc -Z build-std=std,panic_abort
+          $env:TAURI_CONFIG = Get-Content `
+            src-tauri/tauri.webview2-win7-fixed.conf.json `
+            -Raw
+
+          cargo build `
+            --locked `
+            --package dbx `
+            --release `
+            --features custom-protocol `
+            --target x86_64-win7-windows-msvc `
+            -Z build-std=std,panic_abort
 
       - name: Audit Windows 7 PE imports
         shell: pwsh
-        run: ./.github/scripts/assert-win7-pe-compat.ps1 -BinaryPath target/x86_64-win7-windows-msvc/release/dbx.exe
+        run: |
+          ./.github/scripts/assert-win7-pe-compat.ps1 `
+            -BinaryPath `
+            target/x86_64-win7-windows-msvc/release/dbx.exe
 
       - name: Audit Win7 WebView2 loader markers
         shell: pwsh
-        run: ./.github/scripts/assert-webview2-win7-loader.ps1 -BinaryPath target/x86_64-win7-windows-msvc/release/dbx.exe
+        run: |
+          ./.github/scripts/assert-webview2-win7-loader.ps1 `
+            -BinaryPath `
+            target/x86_64-win7-windows-msvc/release/dbx.exe
 
       - name: Bundle and upload Windows 7 / Server 2012 R2 fixed-runtime installer
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
         run: |
           $version = $env:RELEASE_VERSION
-          $bundleDir = "target/x86_64-win7-windows-msvc/release/bundle/nsis"
-          $offlineName = "DBX_${version}_x64-win7-server2012r2-offline-setup.exe"
+
+          $bundleDir = `
+            "target/x86_64-win7-windows-msvc/release/bundle/nsis"
+
+          $offlineName = `
+            "DBX_${version}_x64-win7-server2012r2-offline-setup.exe"
+
           $checksumName = "${offlineName}.sha256"
-          $cargoMetadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
-          $appVersion = ($cargoMetadata.packages | Where-Object { $_.name -eq "dbx" } | Select-Object -First 1).version
+
+          $cargoMetadata = `
+            cargo metadata --no-deps --format-version 1 |
+            ConvertFrom-Json
+
+          $appVersion = (
+            $cargoMetadata.packages |
+            Where-Object { $_.name -eq "dbx" } |
+            Select-Object -First 1
+          ).version
 
           if (!$appVersion -or $appVersion -ne $version) {
-            Write-Error "Release tag version $version does not match the built DBX package version $appVersion"
+            Write-Error `
+              "Release tag version $version does not match built DBX package version $appVersion"
+
             exit 1
           }
 
-          pnpm tauri bundle --bundles nsis --target x86_64-win7-windows-msvc `
+          pnpm tauri bundle `
+            --bundles nsis `
+            --target x86_64-win7-windows-msvc `
             --config src-tauri/tauri.webview2-win7-fixed.conf.json
 
           $installer = Get-ChildItem $bundleDir -Filter "*.exe" |
             Sort-Object LastWriteTimeUtc -Descending |
             Select-Object -First 1
+
           if (!$installer) {
-            Write-Error "Missing Windows 7 / Server 2012 R2 fixed-runtime installer in ${bundleDir}"
+            Write-Error `
+              "Missing Windows 7 / Server 2012 R2 fixed-runtime installer in ${bundleDir}"
+
             exit 1
           }
 
-          ./.github/scripts/assert-win7-installer-content.ps1 -InstallerPath $installer.FullName
+          ./.github/scripts/assert-win7-installer-content.ps1 `
+            -InstallerPath $installer.FullName
 
           Copy-Item $installer.FullName $offlineName -Force
-          $hash = (Get-FileHash -LiteralPath $offlineName -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  $offlineName" | Set-Content -LiteralPath $checksumName -Encoding ascii
-          gh release upload "${env:RELEASE_TAG}" $offlineName $checksumName `
-            --repo "${env:GITHUB_REPOSITORY}" --clobber
+
+          $hash = (
+            Get-FileHash `
+              -LiteralPath $offlineName `
+              -Algorithm SHA256
+          ).Hash.ToLowerInvariant()
+
+          "$hash  $offlineName" |
+            Set-Content `
+              -LiteralPath $checksumName `
+              -Encoding ascii
+
+          gh release upload `
+            "${env:RELEASE_TAG}" `
+            $offlineName `
+            $checksumName `
+            --repo "${env:GITHUB_REPOSITORY}" `
+            --clobber
+
 
   # ============================================================
   # 6. Linux 静态浏览器（musl）
+  #
+  # target:
+  #   static-browser-x64
+  #   static-browser-arm64
+  #   all
   # ============================================================
   static-browser:
+    name: static-browser (${{ matrix.arch }})
+
+    if: >
+      inputs.target == 'all' ||
+      inputs.target == 'static-browser-x64' ||
+      inputs.target == 'static-browser-arm64'
+
     needs: prepare
+
     strategy:
       fail-fast: false
+
       matrix:
         include:
           - platform: ubuntu-22.04
             target: x86_64-unknown-linux-musl
             arch: x64
+            release_target: static-browser-x64
             rustflags: "-C target-feature=+crt-static"
+
           - platform: ubuntu-22.04-arm
             target: aarch64-unknown-linux-musl
             arch: arm64
+            release_target: static-browser-arm64
             rustflags: "-C target-feature=+crt-static -C link-arg=-z -C link-arg=max-page-size=65536"
+
     runs-on: ${{ matrix.platform }}
+
     env:
       CARGO_INCREMENTAL: "0"
       RUSTC_WRAPPER: sccache
@@ -585,6 +874,7 @@ jobs:
       SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
       RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
       RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+
     steps:
       - uses: actions/checkout@v5
         with:
@@ -624,6 +914,7 @@ jobs:
           CACHE_KEY_PREFIX: ${{ secrets.SCCACHE_S3_KEY_PREFIX }}
           CACHE_ACCESS_KEY_ID: ${{ secrets.SCCACHE_S3_ACCESS_KEY_ID }}
           CACHE_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_S3_SECRET_ACCESS_KEY }}
+
         run: |
           {
             echo "SCCACHE_BUCKET=${CACHE_BUCKET}"
@@ -651,70 +942,132 @@ jobs:
       - name: Build static web binary
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
+
         run: |
-          cargo zigbuild --release -p dbx-web --target ${{ matrix.target }} \
-            --no-default-features --features "duckdb-sidecar,dynamodb,mq-admin,dbx-core/sqlite-bundled"
+          cargo zigbuild \
+            --release \
+            -p dbx-web \
+            --target ${{ matrix.target }} \
+            --no-default-features \
+            --features "duckdb-sidecar,dynamodb,mq-admin,dbx-core/sqlite-bundled"
 
       - name: Package static browser runtime
         env:
           DBX_STATIC_TARGET: ${{ matrix.target }}
+
         run: |
-          chmod +x scripts/package-web-static.sh scripts/verify-web-static.sh
+          chmod +x \
+            scripts/package-web-static.sh \
+            scripts/verify-web-static.sh
+
           ./scripts/package-web-static.sh
 
       - name: Verify inside oldest available Ubuntu container
         run: |
           VERIFY_IMAGE=""
+
           for image in ubuntu:14.04 ubuntu:16.04; do
             if docker pull "$image" >/dev/null 2>&1; then
               VERIFY_IMAGE="$image"
               break
             fi
           done
+
           if [ -z "$VERIFY_IMAGE" ]; then
             echo "no legacy Ubuntu image available for $(uname -m)" >&2
             exit 1
           fi
+
           echo "Verifying in $VERIFY_IMAGE"
-          docker run --rm -v "$PWD:/workspace" -w /workspace "$VERIFY_IMAGE" \
+
+          docker run --rm \
+            -v "$PWD:/workspace" \
+            -w /workspace \
+            "$VERIFY_IMAGE" \
             bash scripts/verify-web-static.sh \
             "dist-web-static/dbx-linux-${{ matrix.arch }}-browser-static.tar.gz"
 
       - name: Upload release asset
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
         run: |
           VERSION="$RELEASE_VERSION"
-          PACKAGE_VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "dbx-web") | .version')"
+
+          PACKAGE_VERSION="$(
+            cargo metadata \
+              --no-deps \
+              --format-version 1 |
+            jq -r '.packages[] | select(.name == "dbx-web") | .version'
+          )"
+
           if [ "$PACKAGE_VERSION" != "$VERSION" ]; then
             echo "Release tag version $VERSION does not match dbx-web package version $PACKAGE_VERSION" >&2
             exit 1
           fi
+
           SOURCE="dist-web-static/dbx-linux-${{ matrix.arch }}-browser-static.tar.gz"
+
           ASSET="DBX_${VERSION}_${{ matrix.arch }}-browser-static.tar.gz"
           CHECKSUM="${ASSET}.sha256"
+
           cp "$SOURCE" "$ASSET"
+
           sha256sum "$ASSET" | tee "$CHECKSUM"
-          gh release upload "$RELEASE_TAG" "$ASSET" "$CHECKSUM" \
-            --repo "${GITHUB_REPOSITORY}" --clobber
+
+          gh release upload \
+            "$RELEASE_TAG" \
+            "$ASSET" \
+            "$CHECKSUM" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber
 
       - name: Show sccache stats
         if: always()
         continue-on-error: true
         run: ${SCCACHE_PATH} --show-stats
 
+
   # ============================================================
   # 7. 清理多余的 .sig
+  #
+  # 只有 desktop/windows/win7 相关 target 才执行。
+  #
+  # always() 非常重要：
+  # 某些 matrix job 被 skipped 后，这个 job 仍然能够执行。
   # ============================================================
   cleanup-release-signatures:
-    needs: [prepare, build, build-windows, build-windows-7-offline]
+    name: Cleanup release signatures
+
+    if: >
+      always() &&
+      (
+        inputs.target == 'all' ||
+        inputs.target == 'macos-arm64' ||
+        inputs.target == 'macos-x64' ||
+        inputs.target == 'linux-x64' ||
+        inputs.target == 'linux-arm64' ||
+        inputs.target == 'windows-x64' ||
+        inputs.target == 'windows-arm64' ||
+        inputs.target == 'windows7-x64'
+      )
+
+    needs:
+      - prepare
+      - build
+      - build-windows
+      - build-windows-7-offline
+
     runs-on: ubuntu-latest
+
     env:
       RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+
     steps:
       - name: Remove standalone updater signature assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
         shell: bash
         run: |
           mapfile -t SIG_ASSETS < <(
@@ -731,19 +1084,38 @@ jobs:
 
           for ASSET in "${SIG_ASSETS[@]}"; do
             echo "Deleting release asset: ${ASSET}"
-            gh release delete-asset "$RELEASE_TAG" "${ASSET}" \
+
+            gh release delete-asset \
+              "$RELEASE_TAG" \
+              "${ASSET}" \
               --repo "${GITHUB_REPOSITORY}" \
               --yes
           done
 
+
   # ============================================================
   # 8. JDBC 插件
+  #
+  # 只有：
+  #   target=all
+  #   target=jdbc
+  #
+  # 执行。
   # ============================================================
   jdbc-plugin:
-    needs: [prepare, cleanup-release-signatures, bump-jdbc-plugin-version]
+    name: JDBC plugin
+
+    if: inputs.target == 'all' || inputs.target == 'jdbc'
+
+    needs:
+      - prepare
+      - bump-jdbc-plugin-version
+
     runs-on: ubuntu-latest
+
     env:
       RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+
     steps:
       - uses: actions/checkout@v5
         with:
@@ -759,21 +1131,33 @@ jobs:
 
       - name: Apply automatic JDBC plugin version bump
         shell: bash
-        run: node .github/scripts/bump-jdbc-plugin-version.mjs "${{ needs.bump-jdbc-plugin-version.outputs.prev_tag }}" HEAD --write
+        run: |
+          node .github/scripts/bump-jdbc-plugin-version.mjs \
+            "${{ needs.bump-jdbc-plugin-version.outputs.prev_tag }}" \
+            HEAD \
+            --write
 
       - name: Read JDBC plugin version
         id: jdbc-plugin
         shell: bash
         run: |
-          VERSION="$(sed -nE "s/^version[[:space:]]*=[[:space:]]*'([^']+)'.*/\1/p" plugins/jdbc/build.gradle | head -n 1)"
+          VERSION="$(
+            sed -nE \
+              "s/^version[[:space:]]*=[[:space:]]*'([^']+)'.*/\1/p" \
+              plugins/jdbc/build.gradle |
+            head -n 1
+          )"
+
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Package JDBC plugin
-        run: ./plugins/jdbc/package.sh
+        run: |
+          ./plugins/jdbc/package.sh
 
       - name: Upload JDBC plugin asset
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
         run: |
           gh release upload "$RELEASE_TAG" \
             "plugins/jdbc/dist/dbx-jdbc-plugin-${{ steps.jdbc-plugin.outputs.version }}.zip" \
@@ -784,36 +1168,63 @@ jobs:
       - name: Add JDBC plugin metadata to latest.json
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
         shell: bash
         run: |
           mkdir -p "$RUNNER_TEMP/latest-json"
+
           if ! gh release download "$RELEASE_TAG" \
               --repo "${GITHUB_REPOSITORY}" \
               --pattern latest.json \
               --dir "$RUNNER_TEMP/latest-json" 2>/dev/null; then
+
             echo "No latest.json asset in this release, skipping."
             exit 0
           fi
+
           node .github/scripts/augment-latest-json-jdbc-plugin.mjs \
             "$RUNNER_TEMP/latest-json/latest.json" \
             "${{ steps.jdbc-plugin.outputs.version }}" \
             "1" \
             "https://github.com/t8y2/dbx/releases/latest/download/dbx-jdbc-plugin-latest.zip"
+
           gh release upload "$RELEASE_TAG" \
             "$RUNNER_TEMP/latest-json/latest.json" \
             --repo "${GITHUB_REPOSITORY}" \
             --clobber
 
+
   # ============================================================
-  # 9. Docker 镜像
+  # 9. Docker
+  #
+  # 注意：
+  #
+  # target=docker 会同时构建：
+  #   linux/amd64
+  #   linux/arm64
+  #
+  # 因为最终需要创建 multi-arch manifest。
+  #
+  # 这里没有拆成 docker-amd64 / docker-arm64，
+  # 否则无法直接生成当前的 multi-arch tag。
   # ============================================================
   docker:
+    name: Docker (${{ matrix.platform }})
+
+    if: inputs.target == 'all' || inputs.target == 'docker'
+
     needs: prepare
+
     runs-on: ubuntu-latest
+
     strategy:
       fail-fast: false
+
       matrix:
-        platform: [linux/amd64, linux/arm64]
+        platform:
+          - linux/amd64
+          - linux/arm64
+
     steps:
       - uses: actions/checkout@v5
         with:
@@ -841,56 +1252,103 @@ jobs:
       - name: Build and push Docker Hub by digest
         id: build-dockerhub
         uses: docker/build-push-action@v6
+
         with:
           context: .
           file: deploy/Dockerfile
           platforms: ${{ matrix.platform }}
-          outputs: type=image,name=${{ secrets.DOCKERHUB_USERNAME }}/dbx,push-by-digest=true,name-canonical=true,push=true
+
+          outputs: >
+            type=image,
+            name=${{ secrets.DOCKERHUB_USERNAME }}/dbx,
+            push-by-digest=true,
+            name-canonical=true,
+            push=true
+
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,scope=${{ matrix.platform }},mode=max
 
       - name: Build and push CNB by digest
         id: build-cnb
         uses: docker/build-push-action@v6
+
         with:
           context: .
           file: deploy/Dockerfile
           platforms: ${{ matrix.platform }}
-          outputs: type=image,name=${{ env.CNB_REGISTRY }}/${{ env.CNB_REPOSITORY }},push-by-digest=true,name-canonical=true,push=true
+
+          outputs: >
+            type=image,
+            name=${{ env.CNB_REGISTRY }}/${{ env.CNB_REPOSITORY }},
+            push-by-digest=true,
+            name-canonical=true,
+            push=true
+
           cache-from: type=gha,scope=${{ matrix.platform }}
 
       - name: Export digests
         run: |
-          mkdir -p /tmp/digests/dockerhub /tmp/digests/cnb
+          mkdir -p \
+            /tmp/digests/dockerhub \
+            /tmp/digests/cnb
+
           dockerhub_digest="${{ steps.build-dockerhub.outputs.digest }}"
           cnb_digest="${{ steps.build-cnb.outputs.digest }}"
-          touch "/tmp/digests/dockerhub/${dockerhub_digest#sha256:}"
-          touch "/tmp/digests/cnb/${cnb_digest#sha256:}"
+
+          touch \
+            "/tmp/digests/dockerhub/${dockerhub_digest#sha256:}"
+
+          touch \
+            "/tmp/digests/cnb/${cnb_digest#sha256:}"
 
       - name: Upload Docker Hub digest
         uses: actions/upload-artifact@v7
+
         with:
           name: dockerhub-digests-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+
           path: /tmp/digests/dockerhub/*
+
           if-no-files-found: error
+
           retention-days: 1
 
       - name: Upload CNB digest
         uses: actions/upload-artifact@v7
+
         with:
           name: cnb-digests-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+
           path: /tmp/digests/cnb/*
+
           if-no-files-found: error
+
           retention-days: 1
 
+
+  # ============================================================
+  # 9.1 Docker manifest
+  #
+  # 只有 docker/all 才执行。
+  # ============================================================
   docker-manifest:
-    needs: [prepare, docker]
+    name: Docker manifest
+
+    if: inputs.target == 'all' || inputs.target == 'docker'
+
+    needs:
+      - prepare
+      - docker
+
     runs-on: ubuntu-latest
+
     env:
       RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+
     steps:
       - name: Download Docker Hub digests
         uses: actions/download-artifact@v8
+
         with:
           path: /tmp/digests/dockerhub
           pattern: dockerhub-digests-*
@@ -898,6 +1356,7 @@ jobs:
 
       - name: Download CNB digests
         uses: actions/download-artifact@v8
+
         with:
           path: /tmp/digests/cnb
           pattern: cnb-digests-*
@@ -924,43 +1383,218 @@ jobs:
           docker buildx imagetools create \
             -t ${{ secrets.DOCKERHUB_USERNAME }}/dbx:${RELEASE_VERSION} \
             -t ${{ secrets.DOCKERHUB_USERNAME }}/dbx:latest \
-            $(cd /tmp/digests/dockerhub && printf '${{ secrets.DOCKERHUB_USERNAME }}/dbx@sha256:%s ' *)
+            $(cd /tmp/digests/dockerhub && \
+              printf '${{ secrets.DOCKERHUB_USERNAME }}/dbx@sha256:%s ' *)
 
           docker buildx imagetools create \
             -t ${{ env.CNB_REGISTRY }}/${{ env.CNB_REPOSITORY }}:${RELEASE_VERSION} \
             -t ${{ env.CNB_REGISTRY }}/${{ env.CNB_REPOSITORY }}:latest \
-            $(cd /tmp/digests/cnb && printf '${{ env.CNB_REGISTRY }}/${{ env.CNB_REPOSITORY }}@sha256:%s ' *)
+            $(cd /tmp/digests/cnb && \
+              printf '${{ env.CNB_REGISTRY }}/${{ env.CNB_REPOSITORY }}@sha256:%s ' *)
+
 
   # ============================================================
   # 10. 发布
+  #
+  # 这里最重要。
+  #
+  # 不再要求所有平台都成功。
+  #
+  # 根据 inputs.target 判断：
+  #
+  # macos-arm64
+  #     -> 只要求 build 成功
+  #
+  # windows-x64
+  #     -> 只要求 build-windows 成功
+  #
+  # windows7-x64
+  #     -> 只要求 build-windows-7-offline 成功
+  #
+  # static-browser-x64/arm64
+  #     -> 只要求 static-browser 成功
+  #
+  # docker
+  #     -> 要求 docker-manifest 成功
+  #
+  # jdbc
+  #     -> 要求 jdbc-plugin 成功
+  #
+  # all
+  #     -> 所有正式发布组件成功
+  #
+  # 注意：Nix 是 advisory，所以不阻塞 all。
   # ============================================================
   publish:
-    needs: [prepare, cleanup-release-signatures, docker-manifest, jdbc-plugin, static-browser]
+    name: Publish release
+
+    if: >
+      always() &&
+      (
+        (
+          inputs.target == 'all' &&
+          needs.prepare.result == 'success' &&
+          needs.build.result == 'success' &&
+          needs.build-windows.result == 'success' &&
+          needs.build-windows-7-offline.result == 'success' &&
+          needs.static-browser.result == 'success' &&
+          needs.docker.result == 'success' &&
+          needs.docker-manifest.result == 'success' &&
+          needs.jdbc-plugin.result == 'success' &&
+          (
+            needs.cleanup-release-signatures.result == 'success' ||
+            needs.cleanup-release-signatures.result == 'skipped'
+          )
+        )
+
+        ||
+
+        (
+          (
+            inputs.target == 'macos-arm64' ||
+            inputs.target == 'macos-x64' ||
+            inputs.target == 'linux-x64' ||
+            inputs.target == 'linux-arm64'
+          ) &&
+          needs.prepare.result == 'success' &&
+          needs.build.result == 'success' &&
+          (
+            needs.cleanup-release-signatures.result == 'success' ||
+            needs.cleanup-release-signatures.result == 'skipped'
+          )
+        )
+
+        ||
+
+        (
+          (
+            inputs.target == 'windows-x64' ||
+            inputs.target == 'windows-arm64'
+          ) &&
+          needs.prepare.result == 'success' &&
+          needs.build-windows.result == 'success' &&
+          (
+            needs.cleanup-release-signatures.result == 'success' ||
+            needs.cleanup-release-signatures.result == 'skipped'
+          )
+        )
+
+        ||
+
+        (
+          inputs.target == 'windows7-x64' &&
+          needs.prepare.result == 'success' &&
+          needs.build-windows-7-offline.result == 'success' &&
+          (
+            needs.cleanup-release-signatures.result == 'success' ||
+            needs.cleanup-release-signatures.result == 'skipped'
+          )
+        )
+
+        ||
+
+        (
+          (
+            inputs.target == 'static-browser-x64' ||
+            inputs.target == 'static-browser-arm64'
+          ) &&
+          needs.prepare.result == 'success' &&
+          needs.static-browser.result == 'success'
+        )
+
+        ||
+
+        (
+          inputs.target == 'docker' &&
+          needs.prepare.result == 'success' &&
+          needs.docker.result == 'success' &&
+          needs.docker-manifest.result == 'success'
+        )
+
+        ||
+
+        (
+          inputs.target == 'jdbc' &&
+          needs.prepare.result == 'success' &&
+          needs.bump-jdbc-plugin-version.result == 'success' &&
+          needs.jdbc-plugin.result == 'success'
+        )
+      )
+
+    needs:
+      - prepare
+      - build
+      - build-windows
+      - build-windows-7-offline
+      - static-browser
+      - docker
+      - docker-manifest
+      - bump-jdbc-plugin-version
+      - jdbc-plugin
+      - cleanup-release-signatures
+
     runs-on: ubuntu-latest
+
     env:
       RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+
     steps:
+      - name: Show release information
+        shell: bash
+        run: |
+          echo "========================================"
+          echo "Release"
+          echo "========================================"
+          echo "Tag:    $RELEASE_TAG"
+          echo "Target: ${{ inputs.target }}"
+          echo "========================================"
+
       - name: Publish draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
         run: |
           gh release edit "$RELEASE_TAG" \
             --repo "${{ github.repository }}" \
-            --draft=false --prerelease
+            --draft=false \
+            --prerelease
+
 
   # ============================================================
-  # 11. 同步到 CNB（可选；无需可整段删掉）
+  # 11. 同步到 CNB
+  #
+  # 每次增量发版成功后：
+  #
+  # GitHub Release
+  #       ↓
+  # 下载当前 Release 全部 Asset
+  #       ↓
+  # 同步 CNB
+  #
+  # 因此第二次补发 Windows 时，
+  # CNB 最终也会包含第一次的 Mac + 第二次的 Windows。
   # ============================================================
   sync-release-to-cnb:
     name: Sync release to CNB
-    needs: [prepare, publish]
+
+    if: >
+      always() &&
+      needs.publish.result == 'success'
+
+    needs:
+      - prepare
+      - publish
+
     runs-on: ubuntu-latest
     continue-on-error: true
+
     env:
       RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+
         with:
           ref: ${{ needs.prepare.outputs.tag }}
 
@@ -969,13 +1603,19 @@ jobs:
           TAG_NAME: ${{ needs.prepare.outputs.tag }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/github-release" "$RUNNER_TEMP/release-assets"
+
+          mkdir -p \
+            "$RUNNER_TEMP/github-release" \
+            "$RUNNER_TEMP/release-assets"
+
           gh release view "$TAG_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --json tagName,name,body,targetCommitish,isPrerelease,isDraft,assets \
             > "$RUNNER_TEMP/github-release/release.json"
+
           gh release download "$TAG_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --dir "$RUNNER_TEMP/release-assets" \
@@ -985,6 +1625,7 @@ jobs:
         env:
           CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
           CNB_UPLOAD_CONCURRENCY: "3"
+
         run: |
           node .github/scripts/sync-cnb-release.mjs \
             --github-release "$RUNNER_TEMP/github-release/release.json" \
@@ -992,9 +1633,11 @@ jobs:
 
       - name: Keep latest five app releases in CNB
         continue-on-error: true
+
         env:
           CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
           CURRENT_TAG: ${{ needs.prepare.outputs.tag }}
+
         run: |
           node .github/scripts/cleanup-cnb-releases.mjs \
             --current-tag "$CURRENT_TAG" \
