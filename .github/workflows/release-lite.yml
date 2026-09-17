@@ -511,7 +511,9 @@ jobs:
           tagName: ${{ needs.prepare.outputs.tag }}
           releaseDraft: true
           assetNamePattern: ${{ matrix.asset_pattern }}
-          args: --target ${{ matrix.target }}
+          args:
+            --target ${{ matrix.target }}
+            --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
       - name: Verify AppImage input methods
         if: startsWith(matrix.platform, 'ubuntu')
@@ -663,6 +665,7 @@ jobs:
         run: |
           pnpm tauri build \
             --target ${{ matrix.target }} \
+            --config '{"bundle":{"createUpdaterArtifacts":false}}' \
             --no-bundle
 
       - name: Build and upload WebView2 offline installer
@@ -690,6 +693,7 @@ jobs:
             --bundles nsis \
             --target ${{ matrix.target }} `
             --config src-tauri/tauri.webview2-offline.conf.json
+            --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
           $installer = Get-ChildItem $bundleDir -Filter "*.exe" |
             Where-Object {
