@@ -667,7 +667,7 @@ jobs:
       - name: Build frontend and Windows executable
         shell: pwsh
         run: |
-          pnpm tauri build --target ${{ matrix.target }} --config "{\"bundle\":{\"createUpdaterArtifacts\":false}}" --no-bundle
+          pnpm tauri build --target ${{ matrix.target }} --config src-tauri/config.json --no-bundle
 
       # 关键修复：同上，把 pnpm tauri bundle 写成单行，避免 "\" 与 "`" 混用。
       - name: Build and upload WebView2 offline installer
@@ -690,7 +690,7 @@ jobs:
               }
           }
 
-          pnpm tauri bundle --bundles nsis --target ${{ matrix.target }} --config src-tauri/tauri.webview2-offline.conf.json --config "{\"bundle\":{\"createUpdaterArtifacts\":false}}"
+          pnpm tauri bundle --bundles nsis --target ${{ matrix.target }} --config src-tauri/tauri.webview2-offline.conf.json --config src-tauri/config.json
 
           $installer = Get-ChildItem $bundleDir -Filter "*.exe" |
             Where-Object {
