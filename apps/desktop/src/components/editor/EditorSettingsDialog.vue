@@ -101,6 +101,7 @@ import {
   type McpConnectionPolicy,
   type McpGroupPolicy,
   type ClickTableNavigationTarget,
+  type EditorSettings,
   type SqlCompletionTriggerMode,
   type TableHoverLookupMode,
   SIDEBAR_INDENT_MIN,
@@ -121,6 +122,7 @@ import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { useTheme } from "@/composables/useTheme";
 import { copyToClipboard, readTextFromClipboard } from "@/lib/common/clipboard";
 import { importClipboardApiKeyAfterConfirmation, type AiConfigDeepLinkDraft } from "@/lib/ai/aiConfigDeepLink";
+import { clearDebugLogs as clearStoredDebugLogs, downloadDebugLogs, getDebugLogBundleText } from "@/lib/backend/debugLog";
 import {
   aiTestConnection,
   checkMcpServerStatus,
@@ -134,6 +136,7 @@ import {
   forgetSnippetSavedToken,
   forgetWebdavSyncSecretsPassphrase,
   forgetWebdavSavedPassword,
+  getAppSupportInfo,
   checkBackgroundImage,
   clearBackgroundImage,
   saveBackgroundImage,
@@ -158,6 +161,8 @@ import {
   webdavSyncSecretsStatus,
   webdavSyncTest,
   webdavSyncUpload,
+  listInstalledAgentsLocal,
+  type AppSupportInfo,
   type McpHttpServerSettings,
   type McpHttpServerStatus,
   type WebMcpHttpStatus,
@@ -203,9 +208,28 @@ import { combineDataTypeForDatabase, dataTypeLengthInputValue, getDataTypeOption
 import { useToast } from "@/composables/useToast";
 import type { DatabaseType, SqlShortcutAction, SqlSnippet } from "@/types/database";
 import { uuid } from "@/lib/common/utils";
-import { findSqlShortcutConflicts, hasSqlShortcutConflicts as sqlShortcutsHaveConflicts, SQL_SHORTCUT_TABLE_TOKEN } from "@/lib/sql/sqlShortcutActions";
+import { DEFAULT_SQL_SHORTCUT_SELECT_LIMIT } from "@/lib/sql/sqlDialectSelectLimit";
+import {
+  BUILTIN_SQL_SHORTCUT_COUNT_ID,
+  BUILTIN_SQL_SHORTCUT_SELECT_LIMIT_ID,
+  canonicalSqlShortcutSql,
+  DEFAULT_SQL_SHORTCUTS,
+  findSqlShortcutConflicts,
+  hasSqlShortcutConflicts as sqlShortcutsHaveConflicts,
+  isBuiltinSqlShortcut,
+  mergeDefaultSqlShortcuts,
+  normalizeSqlShortcutLimit,
+  resolveSqlShortcutBody,
+  SQL_SHORTCUT_TABLE_TOKEN,
+  sqlShortcutDisplaySql,
+  deriveSqlShortcutDatabaseTypes,
+} from "@/lib/sql/sqlShortcutActions";
+import { applySqlShortcutBodyToAllSelected, buildSqlShortcutBodiesForSave, clearSqlShortcutFormDatabaseTypes as clearSqlShortcutFormBodies, switchSqlShortcutEditingDatabaseType, toggleSqlShortcutFormDatabaseType, type SqlShortcutFormBodies } from "@/lib/sql/sqlShortcutFormBodies";
 import { DEFAULT_SQL_SNIPPETS } from "@/lib/sql/sqlCompletion";
 import AiProviderLogo from "@/components/icons/AiProviderLogo.vue";
+import AppLogo from "@/components/icons/AppLogo.vue";
+import ChangelogPanel from "@/components/settings/ChangelogPanel.vue";
+import SettingsTransferPanel from "@/components/settings/SettingsTransferPanel.vue";
 import McpResourceScopePicker from "@/components/settings/McpResourceScopePicker.vue";
 import McpDatabaseScopePicker from "@/components/settings/McpDatabaseScopePicker.vue";
 import McpAuthorizationStepper from "@/components/settings/McpAuthorizationStepper.vue";
@@ -213,7 +237,19 @@ import ScheduledDatabaseBackupSettings from "@/components/backup/ScheduledDataba
 import SqlFormatterSettingsPanel from "./SqlFormatterSettingsPanel.vue";
 import { APP_CUSTOM_UI_COLOR_DEFS, APP_THEME_PALETTES, type AppCornerStyle, type AppCustomUiColors, type AppThemeAppearance, type AppThemeMode, type AppThemePalette } from "@/lib/app/appTheme";
 import { BACKGROUND_IMAGE_DISPLAY_MODES, BACKGROUND_IMAGE_STORAGE_LIMIT_BYTES, defaultBackgroundImageSettings, normalizeBackgroundImageDisplayMode, type BackgroundImageSettings } from "@/lib/app/appBackgroundImage";
-import { editorSettingsDraftChanged, editorSettingsDraftFromSettings, editorSettingsPatchFromDraft, normalizeQueryResultMaxRowsDraft, normalizeTableOpenPageSizeDraft, shouldConfirmEditorSettingsDialogClose, type EditorSettingsDraft } from "@/lib/settings/editorSettingsDraft";
+import {
+  editorSettingsDraftChanged,
+  editorSettingsDraftFromSettings,
+  editorSettingsDraftPatchFromSettings,
+  editorSettingsPatchFromDraft,
+  normalizeQueryResultMaxRowsDraft,
+  normalizeTableOpenPageSizeDraft,
+  shouldConfirmEditorSettingsDialogClose,
+  type EditorSettingsDraft,
+  type EditorSettingsDraftKey,
+} from "@/lib/settings/editorSettingsDraft";
+import { applyEditorSettingsDraftToRefs, type EditorSettingsDraftRefMap } from "@/lib/settings/applyEditorSettingsDraft";
+import { serializeSettingsTransfer, sortTransferCategories, transferCategoryForKey, type SettingsTransferCategoryId } from "@/lib/settings/settingsTransfer";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import { usePromptTemplateStore } from "@/stores/promptTemplateStore";
@@ -236,6 +272,7 @@ import { DEFAULT_WEB_DAV_AUTO_UPLOAD_INTERVAL_MINUTES, DEFAULT_WEB_DAV_REMOTE_PA
 import { apiUrl, webPath } from "@/lib/common/webPath";
 import { DEFAULT_DATA_GRID_FONT_FAMILY, DEFAULT_UI_FONT_FAMILY, normalizeCustomFontFamilyInput, readableFontFamily, SYSTEM_UI_FONT_FAMILY } from "@/lib/app/appFonts";
 import { buildFontFamilyOptions, displayFontFamily, isPresetFontFamily, loadSystemFontNames } from "@/lib/app/fontFamilyOptions";
+import { buildAppSupportInfoRows, formatAppSupportInfoForClipboard, type AppSupportInfoLabels } from "@/lib/app/supportInfo";
 import { useUiFontFamilyPreview } from "@/composables/useUiFontFamilyPreview";
 import { useMeasuredWidth } from "@/composables/useMeasuredWidth";
 import { DateTimePatterns, normalizeSupportedDateTimePattern } from "@/lib/dataGrid/columnFormatter";
@@ -522,6 +559,8 @@ const startupDuckDbWorkerMaxProcesses = ref(settingsStore.desktopSettings.duckdb
 const duckDbWorkerStartupCaptured = ref(false);
 const duckDbRestarting = ref(false);
 const editSidebarTablePageSize = ref(settingsStore.desktopSettings.sidebar_table_page_size ?? DEFAULT_SIDEBAR_TABLE_PAGE_SIZE);
+const debugLogCopied = ref(false);
+const debugLogDownloaded = ref(false);
 const editShowColumnCommentsInHeader = ref(settingsStore.editorSettings.showColumnCommentsInHeader);
 const editShowColumnTypesInHeader = ref(settingsStore.editorSettings.showColumnTypesInHeader);
 const editDataGridShowTransposeFieldMetadata = ref(settingsStore.editorSettings.dataGridShowTransposeFieldMetadata);
@@ -715,10 +754,79 @@ function editableSnippet(snippet: SqlSnippet): SqlSnippet {
 const editSnippets = ref<SqlSnippet[]>(settingsStore.editorSettings.snippets.map(editableSnippet));
 
 function editableSqlShortcut(action: SqlShortcutAction): SqlShortcutAction {
-  return { ...action, enabled: action.enabled !== false };
+  const next: SqlShortcutAction = { ...action, enabled: action.enabled !== false };
+  if (action.kind === "select-limit" || action.id === BUILTIN_SQL_SHORTCUT_SELECT_LIMIT_ID) {
+    next.kind = "select-limit";
+    next.limit = normalizeSqlShortcutLimit(action.limit);
+    next.sql = canonicalSqlShortcutSql(next);
+    delete next.databaseTypes;
+    delete next.sqlByDatabaseType;
+  } else {
+    delete next.kind;
+    delete next.limit;
+    if (action.sqlByDatabaseType && Object.keys(action.sqlByDatabaseType).length > 0) {
+      next.sqlByDatabaseType = { ...action.sqlByDatabaseType };
+    } else {
+      delete next.sqlByDatabaseType;
+    }
+    const databaseTypes = deriveSqlShortcutDatabaseTypes(action.databaseTypes?.length ? [...action.databaseTypes] : undefined, next.sqlByDatabaseType);
+    if (databaseTypes) next.databaseTypes = databaseTypes;
+    else delete next.databaseTypes;
+  }
+  return next;
 }
 
-const editSqlShortcuts = ref<SqlShortcutAction[]>(settingsStore.editorSettings.sqlShortcuts.map(editableSqlShortcut));
+const editSqlShortcuts = ref<SqlShortcutAction[]>(mergeDefaultSqlShortcuts(settingsStore.editorSettings.sqlShortcuts.map(editableSqlShortcut)));
+
+type SqlShortcutFormState = {
+  label: string;
+  shortcut: string;
+  /** Default fallback template (payload.sql). */
+  sql: string;
+  /** Textarea content for the current editing context. */
+  body: string;
+  kind: "template" | "select-limit";
+  limit: number;
+  databaseTypes: DatabaseType[];
+  sqlByDatabaseType: Partial<Record<DatabaseType, string>>;
+  editingDatabaseType: DatabaseType | "";
+};
+
+function emptySqlShortcutForm(): SqlShortcutFormState {
+  const sql = `SELECT * FROM ${SQL_SHORTCUT_TABLE_TOKEN}`;
+  return {
+    label: "",
+    shortcut: "",
+    sql,
+    body: sql,
+    kind: "template",
+    limit: DEFAULT_SQL_SHORTCUT_SELECT_LIMIT,
+    databaseTypes: [],
+    sqlByDatabaseType: {},
+    editingDatabaseType: "",
+  };
+}
+
+function sqlShortcutFormBodies(form: SqlShortcutFormState): SqlShortcutFormBodies {
+  return {
+    sql: form.sql,
+    body: form.body,
+    databaseTypes: form.databaseTypes,
+    sqlByDatabaseType: form.sqlByDatabaseType,
+    editingDatabaseType: form.editingDatabaseType,
+  };
+}
+
+function patchSqlShortcutFormBodies(next: SqlShortcutFormBodies) {
+  sqlShortcutForm.value = {
+    ...sqlShortcutForm.value,
+    sql: next.sql,
+    body: next.body,
+    databaseTypes: next.databaseTypes,
+    sqlByDatabaseType: next.sqlByDatabaseType,
+    editingDatabaseType: next.editingDatabaseType,
+  };
+}
 
 function currentEditorSettingsDraft(): EditorSettingsDraft {
   return {
@@ -940,8 +1048,10 @@ const snippetFormPrefixError = ref("");
 
 const sqlShortcutDialogOpen = ref(false);
 const sqlShortcutEditingId = ref<string | null>(null);
-const sqlShortcutForm = ref({ label: "", shortcut: "", sql: "" });
+const sqlShortcutForm = ref<SqlShortcutFormState>(emptySqlShortcutForm());
 const sqlShortcutFormLabelError = ref("");
+const sqlShortcutPreviewDatabaseType = ref<DatabaseType>("mysql");
+const sqlShortcutDatabaseTypesOpen = ref(false);
 const editingSqlShortcutInputId = ref<string | null>(null);
 const iconThemeBlackDescriptionText = computed(() => (isMacOS() ? t("settings.iconThemeBlackDescriptionMac") : t("settings.iconThemeBlackDescription")));
 const layoutDescTruncated = {
@@ -1072,54 +1182,161 @@ function confirmDeleteSnippet(snippet: SqlSnippet) {
 
 function openAddSqlShortcutDialog() {
   sqlShortcutEditingId.value = null;
-  sqlShortcutForm.value = { label: "", shortcut: "", sql: `SELECT * FROM ${SQL_SHORTCUT_TABLE_TOKEN}` };
+  sqlShortcutForm.value = emptySqlShortcutForm();
   sqlShortcutFormLabelError.value = "";
+  sqlShortcutPreviewDatabaseType.value = "mysql";
+  sqlShortcutDatabaseTypesOpen.value = false;
   editingSqlShortcutInputId.value = null;
   sqlShortcutDialogOpen.value = true;
 }
 
 function openEditSqlShortcutDialog(action: SqlShortcutAction) {
   sqlShortcutEditingId.value = action.id;
+  const databaseTypes = action.databaseTypes ? [...action.databaseTypes] : [];
+  const sqlByDatabaseType = action.sqlByDatabaseType ? { ...action.sqlByDatabaseType } : {};
+  const editingDatabaseType = databaseTypes[0] ?? "";
+  const fallbackSql = action.sql;
   sqlShortcutForm.value = {
     label: action.label,
     shortcut: action.shortcut,
-    sql: action.sql,
+    sql: fallbackSql,
+    body: editingDatabaseType ? resolveSqlShortcutBody(action, editingDatabaseType) : fallbackSql,
+    kind: action.kind === "select-limit" || action.id === BUILTIN_SQL_SHORTCUT_SELECT_LIMIT_ID ? "select-limit" : "template",
+    limit: normalizeSqlShortcutLimit(action.limit),
+    databaseTypes,
+    sqlByDatabaseType,
+    editingDatabaseType,
   };
   sqlShortcutFormLabelError.value = "";
+  sqlShortcutPreviewDatabaseType.value = databaseTypes[0] ?? "mysql";
+  sqlShortcutDatabaseTypesOpen.value = false;
   editingSqlShortcutInputId.value = null;
   sqlShortcutDialogOpen.value = true;
 }
 
+const sqlShortcutFormIsBuiltin = computed(() => !!sqlShortcutEditingId.value && isBuiltinSqlShortcut(sqlShortcutEditingId.value));
+
+const sqlShortcutFormBuiltinLabel = computed(() => {
+  if (!sqlShortcutEditingId.value) return "";
+  return sqlShortcutDisplayLabel({
+    id: sqlShortcutEditingId.value,
+    label: sqlShortcutForm.value.label,
+    shortcut: "",
+    sql: "",
+  });
+});
+
+function sqlShortcutDisplayLabel(action: SqlShortcutAction): string {
+  if (action.id === BUILTIN_SQL_SHORTCUT_SELECT_LIMIT_ID) return t("settings.sqlShortcutBuiltinSelectLimit");
+  if (action.id === BUILTIN_SQL_SHORTCUT_COUNT_ID) return t("settings.sqlShortcutBuiltinCount");
+  return action.label;
+}
+
+function onSqlShortcutEditingDatabaseTypeChange(next: DatabaseType | "") {
+  if (!next) return;
+  patchSqlShortcutFormBodies(switchSqlShortcutEditingDatabaseType(sqlShortcutFormBodies(sqlShortcutForm.value), next));
+}
+
+function toggleSqlShortcutDatabaseType(dbType: DatabaseType) {
+  patchSqlShortcutFormBodies(toggleSqlShortcutFormDatabaseType(sqlShortcutFormBodies(sqlShortcutForm.value), dbType));
+}
+
+function clearSqlShortcutDatabaseTypes() {
+  patchSqlShortcutFormBodies(clearSqlShortcutFormBodies(sqlShortcutFormBodies(sqlShortcutForm.value)));
+}
+
+function applySqlShortcutSqlToAllSelected() {
+  patchSqlShortcutFormBodies(applySqlShortcutBodyToAllSelected(sqlShortcutFormBodies(sqlShortcutForm.value)));
+  toast(t("settings.sqlShortcutsApplySqlToAllSelectedDone"), 2500);
+}
+
+const sqlShortcutFormPreviewSql = computed(() =>
+  sqlShortcutDisplaySql(
+    {
+      id: sqlShortcutEditingId.value ?? "preview",
+      label: "preview",
+      shortcut: "",
+      sql: sqlShortcutForm.value.sql,
+      kind: sqlShortcutForm.value.kind,
+      limit: sqlShortcutForm.value.limit,
+      sqlByDatabaseType: sqlShortcutForm.value.sqlByDatabaseType,
+    },
+    sqlShortcutForm.value.kind === "select-limit" ? sqlShortcutPreviewDatabaseType.value : sqlShortcutForm.value.editingDatabaseType || undefined,
+  ),
+);
+
+function sqlShortcutListSql(action: SqlShortcutAction): string {
+  return sqlShortcutDisplaySql(action);
+}
+
+function sqlShortcutDatabaseTypesLabel(action: SqlShortcutAction): string {
+  if (isBuiltinSqlShortcut(action.id) || !action.databaseTypes?.length) return t("settings.sqlShortcutsDatabaseTypesAll");
+  return action.databaseTypes.map((dbType) => dbTypeLabel(dbType)).join(", ");
+}
+
 function saveSqlShortcut() {
+  const editingId = sqlShortcutEditingId.value;
+  const existing = editingId ? editSqlShortcuts.value.find((item) => item.id === editingId) : undefined;
+  const isBuiltin = !!editingId && isBuiltinSqlShortcut(editingId);
+
+  if (isBuiltin && existing) {
+    const limit = normalizeSqlShortcutLimit(sqlShortcutForm.value.limit);
+    const payload: SqlShortcutAction = {
+      ...existing,
+      shortcut: sqlShortcutForm.value.shortcut.trim(),
+      enabled: existing.enabled !== false,
+    };
+    if (existing.id === BUILTIN_SQL_SHORTCUT_SELECT_LIMIT_ID || existing.kind === "select-limit") {
+      payload.kind = "select-limit";
+      payload.limit = limit;
+      payload.sql = canonicalSqlShortcutSql({ kind: "select-limit", limit, sql: "" });
+      delete payload.databaseTypes;
+      delete payload.sqlByDatabaseType;
+    }
+    const nextShortcuts = editSqlShortcuts.value.map((item) => (item.id === editingId ? payload : item));
+    if (sqlShortcutsHaveConflicts(nextShortcuts, editShortcuts.value)) {
+      toast(t("settings.shortcutConflict"), 3000);
+      return;
+    }
+    editSqlShortcuts.value = nextShortcuts.map(editableSqlShortcut);
+    sqlShortcutDialogOpen.value = false;
+    void commitSqlShortcuts();
+    return;
+  }
+
   const label = sqlShortcutForm.value.label.trim();
   if (!label) {
     sqlShortcutFormLabelError.value = t("settings.sqlShortcutsLabelRequired");
     return;
   }
+  const bodies = buildSqlShortcutBodiesForSave(sqlShortcutFormBodies(sqlShortcutForm.value));
   const payload: SqlShortcutAction = {
-    id: sqlShortcutEditingId.value ?? uuid(),
+    id: editingId ?? uuid(),
     label,
     shortcut: sqlShortcutForm.value.shortcut.trim(),
-    sql: sqlShortcutForm.value.sql,
-    enabled: true,
+    sql: bodies.sql,
+    enabled: existing?.enabled !== false,
   };
-  const nextShortcuts = sqlShortcutEditingId.value
-    ? editSqlShortcuts.value.map((item) =>
-        item.id === sqlShortcutEditingId.value
-          ? {
-              ...payload,
-              enabled: item.enabled !== false,
-            }
-          : item,
-      )
-    : [...editSqlShortcuts.value, payload];
+  if (bodies.databaseTypes) payload.databaseTypes = bodies.databaseTypes;
+  if (bodies.sqlByDatabaseType) payload.sqlByDatabaseType = bodies.sqlByDatabaseType;
+  const nextShortcuts = editingId ? editSqlShortcuts.value.map((item) => (item.id === editingId ? payload : item)) : [...editSqlShortcuts.value, payload];
   if (sqlShortcutsHaveConflicts(nextShortcuts, editShortcuts.value)) {
     toast(t("settings.shortcutConflict"), 3000);
     return;
   }
-  editSqlShortcuts.value = nextShortcuts;
+  editSqlShortcuts.value = nextShortcuts.map(editableSqlShortcut);
   sqlShortcutDialogOpen.value = false;
   void commitSqlShortcuts();
+}
+
+function confirmDeleteSqlShortcut(action: SqlShortcutAction) {
+  if (isBuiltinSqlShortcut(action.id)) {
+    toast(t("settings.sqlShortcutsBuiltinDeleteBlocked"), 3000);
+    return;
+  }
+  if (window.confirm(t("settings.sqlShortcutsDeleteConfirm", { name: sqlShortcutDisplayLabel(action) }))) {
+    deleteSqlShortcut(action.id);
+  }
 }
 
 function setSqlShortcutEnabled(id: string, enabled: boolean) {
@@ -1137,14 +1354,9 @@ function setSqlShortcutEnabled(id: string, enabled: boolean) {
 }
 
 function deleteSqlShortcut(id: string) {
+  if (isBuiltinSqlShortcut(id)) return;
   editSqlShortcuts.value = editSqlShortcuts.value.filter((item) => item.id !== id);
   void commitSqlShortcuts();
-}
-
-function confirmDeleteSqlShortcut(action: SqlShortcutAction) {
-  if (window.confirm(t("settings.sqlShortcutsDeleteConfirm", { name: action.label }))) {
-    deleteSqlShortcut(action.id);
-  }
 }
 
 function onSqlShortcutBindingKeydown(id: string, event: KeyboardEvent) {
@@ -1353,7 +1565,7 @@ function syncEditorSettingsDraftFromStore() {
   editUpdateDownloadSource.value = settingsStore.editorSettings.updateDownloadSource;
   editToolbarItems.value = { ...settingsStore.editorSettings.toolbarItems };
   editSnippets.value = settingsStore.editorSettings.snippets.map(editableSnippet);
-  editSqlShortcuts.value = settingsStore.editorSettings.sqlShortcuts.map(editableSqlShortcut);
+  editSqlShortcuts.value = mergeDefaultSqlShortcuts(settingsStore.editorSettings.sqlShortcuts.map(editableSqlShortcut));
   editSqlVariableSubstitutionEnabled.value = settingsStore.editorSettings.sqlVariableSubstitutionEnabled;
   editSqlVariableSyntaxOverrides.value = normalizeSqlVariableSyntaxOverrides(settingsStore.editorSettings.sqlVariableSyntaxOverrides);
   editClickTableNavigationTarget.value = settingsStore.editorSettings.clickTableNavigationTarget;
@@ -1361,6 +1573,144 @@ function syncEditorSettingsDraftFromStore() {
   hasImportedSettingsPendingApply.value = false;
 }
 
+// Mirror of syncEditorSettingsDraftFromStore for loading draft values into
+// the edit refs. Draft values are already settings-shaped and normalized, so
+// this only performs the ref-specific representations (joined textarea
+// strings, grid rows, editable snippet copies). Accepts a key subset so a
+// partial update (settings import) writes exactly the listed refs and leaves
+// every other in-progress edit untouched. The base snapshot is intentionally
+// left untouched: changed values stay unapplied until the user clicks Apply,
+// exactly like hand-edited draft values.
+const editorSettingsDraftRefs: EditorSettingsDraftRefMap = {
+  fontFamily: editFontFamily,
+  fontSize: editFontSize,
+  tableFontFamily: editTableFontFamily,
+  uiFontFamily: editUiFontFamily,
+  uiScale: editUiScale,
+  theme: editTheme,
+  backgroundImage: editBackgroundImage,
+  customThemes: editCustomThemes,
+  activeCustomThemeId: editActiveCustomThemeId,
+  executeMode: editExecuteMode,
+  executeAllOnBlankLine: editExecuteAllOnBlankLine,
+  showExecutionTargetPicker: editShowExecutionTargetPicker,
+  showStatementRunButtons: editShowStatementRunButtons,
+  showLineNumbers: editShowLineNumbers,
+  showCurrentStatementFrame: editShowCurrentStatementFrame,
+  showInsertValueHints: editShowInsertValueHints,
+  autoAliasTables: editAutoAliasTables,
+  insertSpaceAfterCompletion: editInsertSpaceAfterCompletion,
+  sortCompletionColumnsAlphabetically: editSortCompletionColumnsAlphabetically,
+  selectFirstCompletionOnOpen: editSelectFirstCompletionOnOpen,
+  wordWrap: editWordWrap,
+  vimModeEnabled: editVimModeEnabled,
+  autoCloseBrackets: editAutoCloseBrackets,
+  sqlSemanticDiagnosticsMode: editSqlSemanticDiagnosticsMode,
+  confirmDangerousSqlExecution: editConfirmDangerousSqlExecution,
+  confirmUnsavedSqlClose: editConfirmUnsavedSqlClose,
+  appCloseUnsavedTabsMode: editAppCloseUnsavedTabsMode,
+  savedSqlOpenTargetMode: editSavedSqlOpenTargetMode,
+  appLayout: editAppLayout,
+  tabLayout: editTabLayout,
+  tabPlacement: editTabPlacement,
+  tabGroupMode: editTabGroupMode,
+  tabSortMode: editTabSortMode,
+  showColumnCommentsInHeader: editShowColumnCommentsInHeader,
+  showColumnTypesInHeader: editShowColumnTypesInHeader,
+  dataGridShowTransposeFieldMetadata: editDataGridShowTransposeFieldMetadata,
+  colorizeDataGridCellTypes: editColorizeDataGridCellTypes,
+  dataGridTypeColorSchemes: editDataGridTypeColorSchemes,
+  activeDataGridTypeColorSchemeId: editActiveDataGridTypeColorSchemeId,
+  showIndexIndicatorsInHeader: editShowIndexIndicatorsInHeader,
+  compactColumnHeaderActions: editCompactColumnHeaderActions,
+  dataGridQuickEntry: editDataGridQuickEntry,
+  dataGridFilterEditorView: editDataGridFilterEditorView,
+  dataGridKeepFilterEditorExpanded: editDataGridKeepFilterEditorExpanded,
+  dataGridTextFilterPanelHeight: editDataGridTextFilterPanelHeight,
+  defaultAutoKeepResults: editDefaultAutoKeepResults,
+  multiStatementDefaultView: editMultiStatementDefaultView,
+  dataGridAutoTransposeSingleRow: editDataGridAutoTransposeSingleRow,
+  dataGridCellDetailButtonVisible: editDataGridCellDetailButtonVisible,
+  dataGridCrosshairHighlight: editDataGridCrosshairHighlight,
+  pageSize: editPageSize,
+  tableOpenPageSize: editTableOpenPageSize,
+  queryResultMaxRowsEnabled: editQueryResultMaxRowsEnabled,
+  queryResultMaxRows: editQueryResultMaxRows,
+  externalSqlEditorMaxMb: editExternalSqlEditorMaxMb,
+  infiniteScroll: editInfiniteScroll,
+  regexMaxMatchCount: editRegexMaxMatchCount,
+  autoCalculateTotalRows: editAutoCalculateTotalRows,
+  flatteningMultiLineText: editFlatteningMultiLineText,
+  dataGridShowWhitespace: editDataGridShowWhitespace,
+  shortcuts: editShortcuts,
+  sqlFormatter: editSqlFormatter,
+  sidebarActivation: editSidebarActivation,
+  sidebarObjectDisplay: editSidebarObjectDisplay,
+  routineSourceOpenMode: editRoutineSourceOpenMode,
+  sidebarTableSearchEnabled: editSidebarTableSearchEnabled,
+  autoSelectActiveSidebarNode: editAutoSelectActiveSidebarNode,
+  sidebarBrowseObjectsOnDatabaseActivation: editSidebarBrowseObjectsOnDatabaseActivation,
+  openTabsRestoreMode: editOpenTabsRestoreMode,
+  disconnectTabHandlingMode: editDisconnectTabHandlingMode,
+  dataTabReuseMode: editDataTabReuseMode,
+  openDataTabsNextToActive: editOpenDataTabsNextToActive,
+  prefillNewQueryWithSelect: editPrefillNewQueryWithSelect,
+  generateSqlIncludeDatabaseName: editGenerateSqlIncludeDatabaseName,
+  generateSqlQuoteIdentifiers: editGenerateSqlQuoteIdentifiers,
+  formatSqlOnSqlFileSave: editFormatSqlOnSqlFileSave,
+  showTableDdlHoverPreview: editShowTableDdlHoverPreview,
+  tableHoverLookupMode: editTableHoverLookupMode,
+  updateNotificationsEnabled: editUpdateNotificationsEnabled,
+  autoDownloadUpdates: editAutoDownloadUpdates,
+  sidebarObjectInfoMode: editSidebarObjectInfoMode,
+  sidebarAllowHorizontalScroll: editSidebarAllowHorizontalScroll,
+  sidebarShowTooltips: editSidebarShowTooltips,
+  sidebarIndent: editSidebarIndent,
+  sidebarFontSize: editSidebarFontSize,
+  sidebarHiddenTablePrefixes: editSidebarHiddenTablePrefixes,
+  sidebarCopyTableNameSeparator: editSidebarCopyTableNameSeparator,
+  sidebarCopyTableNameIncludeSchema: editSidebarCopyTableNameIncludeSchema,
+  redisKeyTemplates: editRedisKeyTemplates,
+  exportBatchSize: editExportBatchSize,
+  csvQuoteMode: editCsvQuoteMode,
+  exportRowLimitEnabled: editExportRowLimitEnabled,
+  exportRowLimit: editExportRowLimit,
+  queryExportKeysetOptimizationEnabled: editQueryExportKeysetOptimizationEnabled,
+  globalDateTimeDisplayFormat: editGlobalDateTimeDisplayFormat,
+  globalDateTimeExportFormat: editGlobalDateTimeExportFormat,
+  globalDateTimeImportFormat: editGlobalDateTimeImportFormat,
+  updateDownloadSource: editUpdateDownloadSource,
+  toolbarItems: editToolbarItems,
+  snippets: editSnippets,
+  sqlShortcuts: editSqlShortcuts,
+  sqlVariableSubstitutionEnabled: editSqlVariableSubstitutionEnabled,
+  sqlVariableSyntaxOverrides: editSqlVariableSyntaxOverrides,
+  continueOnErrorOnBatch: editContinueOnErrorOnBatch,
+  clickTableNavigationTarget: editClickTableNavigationTarget,
+  completionTriggerMode: editCompletionTriggerMode,
+  defaultTransactionMode: editDefaultTransactionMode,
+  tableColumnTemplateFields: editTableColumnTemplateRows,
+};
+
+function applyEditorSettingsKeysToRefs(draft: EditorSettingsDraft, keys: readonly EditorSettingsDraftKey[]) {
+  applyEditorSettingsDraftToRefs(draft, keys, editorSettingsDraftRefs, {
+    customThemes: (value) => [...(value as CustomTheme[])],
+    dataGridTypeColorSchemes: (value) => cloneDataGridTypeColorSchemes(value as DataGridTypeColorScheme[]),
+    tableColumnTemplateFields: (value) => tableColumnTemplateRowsFromSettings(value as string[]),
+    shortcuts: (value) => normalizeShortcutSettings(value as Parameters<typeof normalizeShortcutSettings>[0]),
+    sqlFormatter: (value) => normalizeSqlFormatterSettings(value as SqlFormatterSettings),
+    sidebarHiddenTablePrefixes: (value) => (value as string[]).join("\n"),
+    redisKeyTemplates: (value) => normalizeRedisKeyTemplates(value as string[]).join("\n"),
+    toolbarItems: (value) => ({ ...(value as EditorSettings["toolbarItems"]) }),
+    snippets: (value) => (value as SqlSnippet[]).map(editableSnippet),
+    sqlShortcuts: (value) => mergeDefaultSqlShortcuts((value as SqlShortcutAction[]).map(editableSqlShortcut)),
+    sqlVariableSyntaxOverrides: (value) => normalizeSqlVariableSyntaxOverrides(value as EditorSettings["sqlVariableSyntaxOverrides"]),
+    backgroundImage: (value) => cloneBackgroundImageDraft(value as BackgroundImageSettings),
+  });
+  if (keys.includes("sqlSemanticDiagnosticsMode")) {
+    editSqlSemanticDiagnosticsEnabled.value = editSqlSemanticDiagnosticsMode.value !== "disabled";
+  }
+}
 // Sync from store when dialog opens
 watch(
   () => settingsVisible.value,
@@ -1789,7 +2139,128 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editShortcuts.value = normalizeShortcutSettings(DEFAULT_EDITOR_SETTINGS.shortcuts);
   } else if (tab === "snippets") {
     editSnippets.value = DEFAULT_SQL_SNIPPETS.map((s) => ({ ...s }));
+  } else if (tab === "about") {
+    editUpdateDownloadSource.value = DEFAULT_EDITOR_SETTINGS.updateDownloadSource;
+    editUpdateNotificationsEnabled.value = DEFAULT_EDITOR_SETTINGS.updateNotificationsEnabled;
+    editAutoDownloadUpdates.value = DEFAULT_EDITOR_SETTINGS.autoDownloadUpdates;
   }
+}
+
+function resetAllDefaults() {
+  // Same contract as resetDefaultsForTab: a full reset also exits any
+  // in-progress shortcut capture (#9066).
+  editingShortcutId.value = null;
+  editFontFamily.value = DEFAULT_EDITOR_SETTINGS.fontFamily;
+  editFontSize.value = DEFAULT_EDITOR_SETTINGS.fontSize;
+  editTableFontFamily.value = DEFAULT_EDITOR_SETTINGS.tableFontFamily;
+  editUiFontFamily.value = DEFAULT_EDITOR_SETTINGS.uiFontFamily;
+  editUiScale.value = DEFAULT_EDITOR_SETTINGS.uiScale;
+  editTheme.value = DEFAULT_EDITOR_SETTINGS.theme;
+  editCustomThemes.value = [...DEFAULT_EDITOR_SETTINGS.customThemes];
+  editActiveCustomThemeId.value = DEFAULT_EDITOR_SETTINGS.activeCustomThemeId;
+  editExecuteMode.value = DEFAULT_EDITOR_SETTINGS.executeMode;
+  editDefaultTransactionMode.value = DEFAULT_EDITOR_SETTINGS.defaultTransactionMode;
+  editExecuteAllOnBlankLine.value = DEFAULT_EDITOR_SETTINGS.executeAllOnBlankLine;
+  editShowExecutionTargetPicker.value = DEFAULT_EDITOR_SETTINGS.showExecutionTargetPicker;
+  editShowStatementRunButtons.value = DEFAULT_EDITOR_SETTINGS.showStatementRunButtons;
+  editShowLineNumbers.value = DEFAULT_EDITOR_SETTINGS.showLineNumbers;
+  editShowCurrentStatementFrame.value = DEFAULT_EDITOR_SETTINGS.showCurrentStatementFrame;
+  editShowInsertValueHints.value = DEFAULT_EDITOR_SETTINGS.showInsertValueHints;
+  editAutoAliasTables.value = DEFAULT_EDITOR_SETTINGS.autoAliasTables;
+  editInsertSpaceAfterCompletion.value = DEFAULT_EDITOR_SETTINGS.insertSpaceAfterCompletion;
+  editSortCompletionColumnsAlphabetically.value = DEFAULT_EDITOR_SETTINGS.sortCompletionColumnsAlphabetically;
+  editSelectFirstCompletionOnOpen.value = DEFAULT_EDITOR_SETTINGS.selectFirstCompletionOnOpen;
+  editWordWrap.value = DEFAULT_EDITOR_SETTINGS.wordWrap;
+  editVimModeEnabled.value = DEFAULT_EDITOR_SETTINGS.vimModeEnabled;
+  editAutoCloseBrackets.value = DEFAULT_EDITOR_SETTINGS.autoCloseBrackets;
+  editSqlSemanticDiagnosticsMode.value = DEFAULT_EDITOR_SETTINGS.sqlSemanticDiagnosticsMode;
+  editSqlSemanticDiagnosticsEnabled.value = DEFAULT_EDITOR_SETTINGS.sqlSemanticDiagnosticsEnabled;
+  editConfirmDangerousSqlExecution.value = DEFAULT_EDITOR_SETTINGS.confirmDangerousSqlExecution;
+  editConfirmUnsavedSqlClose.value = DEFAULT_EDITOR_SETTINGS.confirmUnsavedSqlClose;
+  editAppCloseUnsavedTabsMode.value = DEFAULT_EDITOR_SETTINGS.appCloseUnsavedTabsMode;
+  editSavedSqlOpenTargetMode.value = DEFAULT_EDITOR_SETTINGS.savedSqlOpenTargetMode;
+  editSqlVariableSubstitutionEnabled.value = DEFAULT_EDITOR_SETTINGS.sqlVariableSubstitutionEnabled;
+  editSqlVariableSyntaxOverrides.value = normalizeSqlVariableSyntaxOverrides(DEFAULT_EDITOR_SETTINGS.sqlVariableSyntaxOverrides);
+  editAppLayout.value = DEFAULT_EDITOR_SETTINGS.appLayout;
+  editShowTrayIcon.value = DEFAULT_DESKTOP_SETTINGS.show_tray_icon;
+  editQuitOnClose.value = DEFAULT_DESKTOP_SETTINGS.quit_on_close;
+  desktopCloseBehaviorResetPending.value = true;
+  editIconTheme.value = DEFAULT_DESKTOP_SETTINGS.icon_theme;
+  editDebugLoggingEnabled.value = DEFAULT_DESKTOP_SETTINGS.debug_logging_enabled;
+  editMetadataCacheMaxMemoryMb.value = DEFAULT_DESKTOP_SETTINGS.metadata_cache_max_memory_mb;
+  editDuckDbWorkerProcessIsolation.value = DEFAULT_DESKTOP_SETTINGS.duckdb_worker_process_isolation;
+  editDuckDbWorkerMaxProcesses.value = DEFAULT_DESKTOP_SETTINGS.duckdb_worker_max_processes;
+  editSidebarTablePageSize.value = DEFAULT_SIDEBAR_TABLE_PAGE_SIZE;
+  editShowColumnCommentsInHeader.value = DEFAULT_EDITOR_SETTINGS.showColumnCommentsInHeader;
+  editShowColumnTypesInHeader.value = DEFAULT_EDITOR_SETTINGS.showColumnTypesInHeader;
+  editDataGridShowTransposeFieldMetadata.value = DEFAULT_EDITOR_SETTINGS.dataGridShowTransposeFieldMetadata;
+  editColorizeDataGridCellTypes.value = DEFAULT_EDITOR_SETTINGS.colorizeDataGridCellTypes;
+  // Reset the selection only; saved schemes survive a full settings reset.
+  editActiveDataGridTypeColorSchemeId.value = DEFAULT_EDITOR_SETTINGS.activeDataGridTypeColorSchemeId;
+  editShowIndexIndicatorsInHeader.value = DEFAULT_EDITOR_SETTINGS.showIndexIndicatorsInHeader;
+  editCompactColumnHeaderActions.value = DEFAULT_EDITOR_SETTINGS.compactColumnHeaderActions;
+  editDataGridQuickEntry.value = DEFAULT_EDITOR_SETTINGS.dataGridQuickEntry;
+  editDataGridFilterEditorView.value = DEFAULT_EDITOR_SETTINGS.dataGridFilterEditorView;
+  editDataGridKeepFilterEditorExpanded.value = DEFAULT_EDITOR_SETTINGS.dataGridKeepFilterEditorExpanded;
+  editDataGridTextFilterPanelHeight.value = DEFAULT_EDITOR_SETTINGS.dataGridTextFilterPanelHeight;
+  editDefaultAutoKeepResults.value = DEFAULT_EDITOR_SETTINGS.defaultAutoKeepResults;
+  editMultiStatementDefaultView.value = DEFAULT_EDITOR_SETTINGS.multiStatementDefaultView;
+  editDataGridAutoTransposeSingleRow.value = DEFAULT_EDITOR_SETTINGS.dataGridAutoTransposeSingleRow;
+  editDataGridCellDetailButtonVisible.value = DEFAULT_EDITOR_SETTINGS.dataGridCellDetailButtonVisible;
+  editDataGridCrosshairHighlight.value = DEFAULT_EDITOR_SETTINGS.dataGridCrosshairHighlight;
+  editFlatteningMultiLineText.value = DEFAULT_EDITOR_SETTINGS.flatteningMultiLineText;
+  editDataGridShowWhitespace.value = DEFAULT_EDITOR_SETTINGS.dataGridShowWhitespace;
+  editPageSize.value = DEFAULT_EDITOR_SETTINGS.pageSize;
+  editTableOpenPageSize.value = DEFAULT_EDITOR_SETTINGS.tableOpenPageSize;
+  editQueryResultMaxRowsEnabled.value = DEFAULT_EDITOR_SETTINGS.queryResultMaxRowsEnabled;
+  editQueryResultMaxRows.value = DEFAULT_EDITOR_SETTINGS.queryResultMaxRows;
+  editExternalSqlEditorMaxMb.value = DEFAULT_EDITOR_SETTINGS.externalSqlEditorMaxMb;
+  editInfiniteScroll.value = DEFAULT_EDITOR_SETTINGS.infiniteScroll;
+  editRegexMaxMatchCount.value = DEFAULT_EDITOR_SETTINGS.regexMaxMatchCount;
+  editAutoCalculateTotalRows.value = DEFAULT_EDITOR_SETTINGS.autoCalculateTotalRows;
+  editTableColumnTemplateRows.value = tableColumnTemplateRowsFromSettings(DEFAULT_EDITOR_SETTINGS.tableColumnTemplateFields);
+  editShortcuts.value = normalizeShortcutSettings(DEFAULT_EDITOR_SETTINGS.shortcuts);
+  editSqlFormatter.value = normalizeSqlFormatterSettings(DEFAULT_EDITOR_SETTINGS.sqlFormatter);
+  sqlFormatterConfigValid.value = true;
+  editSidebarActivation.value = DEFAULT_EDITOR_SETTINGS.sidebarActivation;
+  editSidebarObjectDisplay.value = DEFAULT_EDITOR_SETTINGS.sidebarObjectDisplay;
+  editRoutineSourceOpenMode.value = DEFAULT_EDITOR_SETTINGS.routineSourceOpenMode;
+  editSidebarTableSearchEnabled.value = DEFAULT_EDITOR_SETTINGS.sidebarTableSearchEnabled;
+  editAutoSelectActiveSidebarNode.value = DEFAULT_EDITOR_SETTINGS.autoSelectActiveSidebarNode;
+  editSidebarBrowseObjectsOnDatabaseActivation.value = DEFAULT_EDITOR_SETTINGS.sidebarBrowseObjectsOnDatabaseActivation;
+  editOpenTabsRestoreMode.value = DEFAULT_EDITOR_SETTINGS.openTabsRestoreMode;
+  editDisconnectTabHandlingMode.value = DEFAULT_EDITOR_SETTINGS.disconnectTabHandlingMode;
+  editDataTabReuseMode.value = DEFAULT_EDITOR_SETTINGS.dataTabReuseMode;
+  editOpenDataTabsNextToActive.value = DEFAULT_EDITOR_SETTINGS.openDataTabsNextToActive;
+  editPrefillNewQueryWithSelect.value = DEFAULT_EDITOR_SETTINGS.prefillNewQueryWithSelect;
+  editGenerateSqlIncludeDatabaseName.value = DEFAULT_EDITOR_SETTINGS.generateSqlIncludeDatabaseName;
+  editGenerateSqlQuoteIdentifiers.value = DEFAULT_EDITOR_SETTINGS.generateSqlQuoteIdentifiers;
+  editFormatSqlOnSqlFileSave.value = DEFAULT_EDITOR_SETTINGS.formatSqlOnSqlFileSave;
+  editShowTableDdlHoverPreview.value = DEFAULT_EDITOR_SETTINGS.showTableDdlHoverPreview;
+  editTableHoverLookupMode.value = DEFAULT_EDITOR_SETTINGS.tableHoverLookupMode;
+  editUpdateNotificationsEnabled.value = DEFAULT_EDITOR_SETTINGS.updateNotificationsEnabled;
+  editAutoDownloadUpdates.value = DEFAULT_EDITOR_SETTINGS.autoDownloadUpdates;
+  editSidebarObjectInfoMode.value = DEFAULT_EDITOR_SETTINGS.sidebarObjectInfoMode;
+  editSidebarAllowHorizontalScroll.value = DEFAULT_EDITOR_SETTINGS.sidebarAllowHorizontalScroll;
+  editSidebarShowTooltips.value = DEFAULT_EDITOR_SETTINGS.sidebarShowTooltips;
+  editSidebarIndent.value = DEFAULT_EDITOR_SETTINGS.sidebarIndent;
+  editSidebarFontSize.value = DEFAULT_EDITOR_SETTINGS.sidebarFontSize;
+  editSidebarHiddenTablePrefixes.value = DEFAULT_EDITOR_SETTINGS.sidebarHiddenTablePrefixes.join("\n");
+  editSidebarCopyTableNameSeparator.value = DEFAULT_EDITOR_SETTINGS.sidebarCopyTableNameSeparator;
+  editSidebarCopyTableNameIncludeSchema.value = DEFAULT_EDITOR_SETTINGS.sidebarCopyTableNameIncludeSchema;
+  editRedisKeyTemplates.value = normalizeRedisKeyTemplates(DEFAULT_EDITOR_SETTINGS.redisKeyTemplates).join("\n");
+  editExportBatchSize.value = DEFAULT_EDITOR_SETTINGS.exportBatchSize;
+  editCsvQuoteMode.value = DEFAULT_EDITOR_SETTINGS.csvQuoteMode;
+  editGlobalDateTimeDisplayFormat.value = DEFAULT_EDITOR_SETTINGS.globalDateTimeDisplayFormat;
+  editGlobalDateTimeExportFormat.value = DEFAULT_EDITOR_SETTINGS.globalDateTimeExportFormat;
+  editGlobalDateTimeImportFormat.value = DEFAULT_EDITOR_SETTINGS.globalDateTimeImportFormat;
+  editExportRowLimitEnabled.value = DEFAULT_EDITOR_SETTINGS.exportRowLimitEnabled;
+  editExportRowLimit.value = DEFAULT_EDITOR_SETTINGS.exportRowLimit;
+  editQueryExportKeysetOptimizationEnabled.value = DEFAULT_EDITOR_SETTINGS.queryExportKeysetOptimizationEnabled;
+  editUpdateDownloadSource.value = DEFAULT_EDITOR_SETTINGS.updateDownloadSource;
+  editToolbarItems.value = { ...DEFAULT_EDITOR_SETTINGS.toolbarItems };
+  editSnippets.value = DEFAULT_SQL_SNIPPETS.map((s) => ({ ...s }));
+  editSqlShortcuts.value = DEFAULT_SQL_SHORTCUTS.map(editableSqlShortcut);
 }
 
 function addTableColumnTemplateRow() {
@@ -2021,6 +2492,10 @@ function onUiScaleChange(value: unknown) {
   editUiScale.value = next;
 }
 
+function onUpdateDownloadSourceChange(v: any) {
+  if (v === "official" || v === "cnb") editUpdateDownloadSource.value = v;
+}
+
 function setSidebarObjectDisplay(value: "grouped" | "simple") {
   editSidebarObjectDisplay.value = value;
 }
@@ -2137,6 +2612,41 @@ function setSidebarActivation(value: "single" | "double") {
 const activeSettingsTab = ref("appearance");
 const settingsContentScrollRef = ref<HTMLElement | null>(null);
 const isWeb = !isTauriRuntime();
+const appSupportInfo = ref<AppSupportInfo | null>(null);
+const appSupportInfoLoading = ref(false);
+const appSupportInfoError = ref("");
+const appSupportInfoCopied = ref(false);
+const appSupportInfoLabels = computed<AppSupportInfoLabels>(() => ({
+  appVersion: t("settings.supportInfoAppVersion"),
+  runtime: t("settings.supportInfoRuntime"),
+  runtimeDesktop: t("settings.supportInfoRuntimeDesktop"),
+  runtimeWeb: t("settings.supportInfoRuntimeWeb"),
+  operatingSystem: t("settings.supportInfoOperatingSystem"),
+  architecture: t("settings.supportInfoArchitecture"),
+  userAgent: t("settings.supportInfoUserAgent"),
+  databaseTypes: t("settings.supportInfoDatabaseTypes"),
+  localDriverVersions: t("settings.supportInfoLocalDriverVersions"),
+  aiProviders: t("settings.supportInfoAiProviders"),
+  unknown: t("settings.supportInfoUnknown"),
+}));
+const appSupportInfoRows = computed(() => {
+  if (!appSupportInfo.value) return [];
+  const info = appSupportInfo.value;
+  return buildAppSupportInfoRows(info, appSupportInfoLabels.value).map((row) => {
+    const details: string[] = [];
+    if (row.key === "appVersion") {
+      if (info.databaseTypes?.length) details.push(`${appSupportInfoLabels.value.databaseTypes}: ${info.databaseTypes.join(", ")}`);
+      if (info.localDriverVersions?.length) {
+        details.push(`${appSupportInfoLabels.value.localDriverVersions}: ${info.localDriverVersions.map((driver) => `${driver.dbType} ${driver.version}`).join(", ")}`);
+      }
+    }
+    if (row.key === "operatingSystem") {
+      if (info.userAgent?.trim()) details.push(`${appSupportInfoLabels.value.userAgent}: ${info.userAgent.trim()}`);
+      if (info.aiProviders?.length) details.push(`${appSupportInfoLabels.value.aiProviders}: ${info.aiProviders.join(", ")}`);
+    }
+    return { ...row, tooltip: details.join("\n") };
+  });
+});
 const settingsCategoryNav = computed<{ value: SettingsCategory; label: string }[]>(() => [
   { value: "appearance", label: t("settings.appearanceTab") },
   { value: "editor", label: t("settings.editorTab") },
@@ -2151,6 +2661,7 @@ const settingsCategoryNav = computed<{ value: SettingsCategory; label: string }[
   { value: "ai", label: t("settings.aiTab") },
   { value: "mcp" as const, label: t("settings.mcpTab") },
   ...(isWeb ? [{ value: "security" as const, label: t("settings.securityTab") }] : []),
+  { value: "about", label: t("settings.aboutTab") },
 ]);
 const settingsTabsWithApplyFooter = new Set<SettingsCategory>(["editor", "formatter", "appearance", "navigation", "data", "shortcuts", "snippets"]);
 
@@ -2336,6 +2847,141 @@ function openExternalUrl(url: string) {
   } else {
     window.open(url, "_blank", "noopener,noreferrer");
   }
+}
+
+async function copyDebugLogs() {
+  await copyToClipboard(await getDebugLogBundleText());
+  debugLogCopied.value = true;
+  window.setTimeout(() => {
+    debugLogCopied.value = false;
+  }, 1500);
+}
+
+function fallbackAppSupportInfo(): AppSupportInfo {
+  return {
+    appVersion: props.appVersion || "",
+    runtime: isWeb ? "web" : "desktop",
+    osName: "",
+    osVersion: null,
+    arch: "",
+  };
+}
+
+async function refreshAppSupportInfo() {
+  if (appSupportInfoLoading.value) return;
+  appSupportInfoLoading.value = true;
+  appSupportInfoError.value = "";
+  try {
+    const [info, localDrivers] = await Promise.all([getAppSupportInfo(), listInstalledAgentsLocal().catch(() => [])]);
+    const databaseTypes = [
+      ...new Set(
+        connectionStore.connections
+          .map((connection) => {
+            const dbType = connection.db_type.trim();
+            const profile = connection.driver_profile?.trim();
+            return profile && profile !== dbType ? `${dbType}/${profile}` : dbType;
+          })
+          .filter(Boolean),
+      ),
+    ].sort();
+    const localDriverVersions = localDrivers
+      .filter((driver) => driver.installed && driver.installed_version?.trim())
+      .map((driver) => ({ dbType: driver.db_type, version: driver.installed_version!.trim() }))
+      .sort((a, b) => a.dbType.localeCompare(b.dbType));
+    const aiProviders = [
+      ...new Set(
+        settingsStore.aiConfigs
+          .filter((config) => {
+            const preset = getAiProviderPreset(config.provider, config.endpoint);
+            return config.endpoint.trim() && config.model.trim() && (!preset.requiresApiKey || config.apiKey.trim());
+          })
+          .map((config) => getAiProviderPreset(config.provider, config.endpoint).label),
+      ),
+    ].sort();
+    appSupportInfo.value = { ...info, databaseTypes, localDriverVersions, aiProviders };
+  } catch (e: any) {
+    appSupportInfo.value = appSupportInfo.value || fallbackAppSupportInfo();
+    appSupportInfoError.value = e?.message || String(e);
+  } finally {
+    appSupportInfoLoading.value = false;
+  }
+}
+
+async function copyAppSupportInfo() {
+  if (!appSupportInfo.value) await refreshAppSupportInfo();
+  if (!appSupportInfo.value) return;
+  try {
+    await copyToClipboard(formatAppSupportInfoForClipboard(appSupportInfo.value, appSupportInfoLabels.value));
+    appSupportInfoCopied.value = true;
+    window.setTimeout(() => {
+      appSupportInfoCopied.value = false;
+    }, 1500);
+  } catch (e: any) {
+    toast(t("grid.copyFailed", { message: e?.message || String(e) }), 5000);
+  }
+}
+
+// --- Settings import / export (About page card) ---
+
+function buildSettingsExportPayload(): string {
+  return serializeSettingsTransfer(settingsStore.editorSettings, {
+    appVersion: props.appVersion || appSupportInfo.value?.appVersion || undefined,
+  });
+}
+
+// "Apply and export": reuse the regular apply flow so validation, persistence
+// and error toasts behave exactly like the footer Apply button. Returning null
+// aborts the export while keeping the draft editable.
+async function buildAppliedExportPayload(): Promise<string | null> {
+  // persistSettings() silently no-ops while a blocker (shortcut conflicts,
+  // invalid formatter config, row-limit conflict) is active — the footer Apply
+  // button is disabled in that state. Abort the export instead of writing a
+  // file that pretends the draft was applied.
+  if (hasApplyBlocker.value) {
+    toast(t("settings.settingsTransferApplyBlocked"), 5000);
+    return null;
+  }
+  if (!(await applySettingsForResult())) return null;
+  return buildSettingsExportPayload();
+}
+
+// Load validated imported values into the draft. Only the keys the file
+// actually contains are written: in-progress edits the file does not cover —
+// including state that a draft round-trip would drop, like a half-filled
+// table-column template row that has no field name yet — keep their exact
+// draft state. The base snapshot is untouched so everything stays unapplied
+// until the user clicks Apply (or discards via the close flow).
+function applyImportedEditorSettings(imported: Partial<EditorSettings>) {
+  const patch = editorSettingsDraftPatchFromSettings(imported);
+  applyEditorSettingsKeysToRefs(patch as EditorSettingsDraft, Object.keys(patch) as EditorSettingsDraftKey[]);
+  hasImportedSettingsPendingApply.value = true;
+}
+
+// Categories whose draft values differ from the saved base AND are covered by
+// the imported file — these draft changes will be replaced by the import.
+function getDraftConflictCategories(imported: Partial<EditorSettings>): SettingsTransferCategoryId[] {
+  const changedKeys = new Set(Object.keys(editorSettingsPatchFromDraft(currentEditorSettingsDraft(), editEditorSettingsBase.value)));
+  const conflicts = new Set<SettingsTransferCategoryId>();
+  for (const key of Object.keys(imported)) {
+    const category = transferCategoryForKey(key);
+    if (category && changedKeys.has(key)) conflicts.add(category);
+  }
+  return sortTransferCategories(conflicts);
+}
+
+function clearDebugLogs() {
+  clearStoredDebugLogs();
+  debugLogCopied.value = false;
+  debugLogDownloaded.value = false;
+}
+
+async function exportDebugLogs() {
+  const saved = await downloadDebugLogs();
+  if (!saved) return;
+  debugLogDownloaded.value = true;
+  window.setTimeout(() => {
+    debugLogDownloaded.value = false;
+  }, 1500);
 }
 
 // ---------- MCP Server ----------
@@ -3469,6 +4115,7 @@ watch(
       await applyPendingAiConfigDeepLinkDraft();
       if (!isWeb && activeSettingsTab.value === "mcp") void refreshMcpStatus();
       if (!isWeb && activeSettingsTab.value === "ai" && aiIsCliProvider.value) void ensureCliMcpStatus();
+      if (activeSettingsTab.value === "about") void refreshAppSupportInfo();
       await scrollToInitialSettingsSection();
     } else {
       resetSettingsSearchState();
@@ -3544,6 +4191,7 @@ watch(activeSettingsTab, async (tab) => {
     editGlobalInstructions.value = promptTemplateStore.globalInstructions;
   }
   if (tab === "data" && isWeb) void loadWebSqlFileUploadMaxMbSetting();
+  if (tab === "about" && !appSupportInfo.value) void refreshAppSupportInfo();
   if (tab === "appearance") {
     checkLayoutDescTruncation();
   }
@@ -7398,11 +8046,13 @@ onUnmounted(() => {
                   {{ t("settings.sqlShortcutsEmpty") }}
                 </div>
                 <div v-else class="overflow-x-auto rounded-md border">
-                  <table class="w-full min-w-[720px] text-sm">
+                  <table class="w-full min-w-[900px] text-sm">
                     <thead>
                       <tr class="border-b bg-muted/50">
                         <th class="px-3 py-2 text-left font-medium whitespace-nowrap">{{ t("settings.sqlShortcutsLabel") }}</th>
+                        <th class="px-3 py-2 text-left font-medium whitespace-nowrap">{{ t("settings.sqlShortcutsSource") }}</th>
                         <th class="px-3 py-2 text-left font-medium whitespace-nowrap">{{ t("settings.shortcutPressShortcut") }}</th>
+                        <th class="px-3 py-2 text-left font-medium whitespace-nowrap">{{ t("settings.sqlShortcutsDatabaseTypes") }}</th>
                         <th class="px-3 py-2 text-left font-medium whitespace-nowrap">{{ t("settings.snippetsStatus") }}</th>
                         <th class="px-3 py-2 text-left font-medium whitespace-nowrap">{{ t("settings.sqlShortcutsSql") }}</th>
                         <th class="px-3 py-2 w-20"></th>
@@ -7410,11 +8060,19 @@ onUnmounted(() => {
                     </thead>
                     <tbody>
                       <tr v-for="action in editSqlShortcuts" :key="action.id" class="border-b last:border-b-0 hover:bg-muted/30" :class="action.enabled === false ? 'text-muted-foreground' : ''">
-                        <td class="px-3 py-2">{{ action.label }}</td>
+                        <td class="px-3 py-2">{{ sqlShortcutDisplayLabel(action) }}</td>
+                        <td class="px-3 py-2">
+                          <Badge variant="outline" class="h-5 rounded-md px-1.5 text-[11px]" :class="isBuiltinSqlShortcut(action.id) ? 'border-primary/40 text-primary' : 'text-muted-foreground'">
+                            {{ isBuiltinSqlShortcut(action.id) ? t("settings.sqlShortcutsSourceBuiltin") : t("settings.sqlShortcutsSourceCustom") }}
+                          </Badge>
+                        </td>
                         <td class="px-3 py-2">
                           <Badge variant="outline" class="h-5 rounded-md px-1.5 font-mono text-[11px] text-muted-foreground">
                             {{ action.shortcut ? formatShortcutPill(action.shortcut) : t("settings.sqlShortcutsUnbound") }}
                           </Badge>
+                        </td>
+                        <td class="max-w-[180px] truncate px-3 py-2 text-xs text-muted-foreground" :title="sqlShortcutDatabaseTypesLabel(action)">
+                          {{ sqlShortcutDatabaseTypesLabel(action) }}
                         </td>
                         <td class="px-3 py-2">
                           <div class="flex items-center gap-2">
@@ -7424,13 +8082,13 @@ onUnmounted(() => {
                             </Label>
                           </div>
                         </td>
-                        <td class="max-w-[300px] truncate px-3 py-2 font-mono text-xs text-muted-foreground">{{ action.sql }}</td>
+                        <td class="max-w-[300px] truncate px-3 py-2 font-mono text-xs text-muted-foreground" :title="sqlShortcutListSql(action)">{{ sqlShortcutListSql(action) }}</td>
                         <td class="px-3 py-2">
                           <div class="flex items-center gap-1">
                             <Button variant="ghost" size="icon-xs" @click="openEditSqlShortcutDialog(action)">
                               <Pencil class="size-3.5" />
                             </Button>
-                            <Button variant="ghost" size="icon-xs" @click="confirmDeleteSqlShortcut(action)">
+                            <Button v-if="!isBuiltinSqlShortcut(action.id)" variant="ghost" size="icon-xs" @click="confirmDeleteSqlShortcut(action)">
                               <Trash2 class="size-3.5" />
                             </Button>
                           </div>
@@ -9143,6 +9801,200 @@ LIMIT 100;</pre
             <section v-else-if="activeSettingsTab === 'tunnels'" data-settings-search-id="tunnels" :class="['flex flex-col gap-5 py-2', settingsSearchTargetClass('tunnels')]">
               <TunnelProfileManager />
             </section>
+
+            <section v-else-if="activeSettingsTab === 'about'" data-settings-search-id="about" :class="['flex flex-col gap-5 py-2', settingsSearchTargetClass('about')]">
+              <div class="rounded-lg border p-4">
+                <div class="settings-about-section-header flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                  <div class="min-w-0 space-y-1">
+                    <Label>{{ t("settings.supportInfoTitle") }}</Label>
+                    <p class="text-sm text-muted-foreground">
+                      {{ t("settings.supportInfoDescription") }}
+                    </p>
+                  </div>
+                  <div class="settings-about-section-actions flex shrink-0 flex-wrap items-center gap-2">
+                    <Button type="button" variant="outline" size="sm" class="shrink-0" :disabled="appSupportInfoLoading && !appSupportInfo" @click="copyAppSupportInfo">
+                      <Loader2 v-if="appSupportInfoLoading && !appSupportInfo" class="mr-1 h-3.5 w-3.5 animate-spin" />
+                      <CheckCircle2 v-else-if="appSupportInfoCopied" class="mr-1 h-3.5 w-3.5" />
+                      <Copy v-else class="mr-1 h-3.5 w-3.5" />
+                      {{ appSupportInfoCopied ? t("settings.supportInfoCopied") : t("settings.supportInfoCopy") }}
+                    </Button>
+                  </div>
+                </div>
+                <TooltipProvider v-if="appSupportInfoRows.length">
+                  <div class="mt-4 grid gap-3 sm:grid-cols-4">
+                    <Tooltip v-for="row in appSupportInfoRows" :key="row.key">
+                      <TooltipTrigger as-child>
+                        <div class="min-w-0 rounded-md bg-muted/30 px-3 py-2" :class="row.tooltip ? 'cursor-help' : ''">
+                          <div class="text-xs font-medium text-muted-foreground">
+                            {{ row.label }}
+                          </div>
+                          <div class="mt-1 min-w-0 select-text break-words font-mono text-xs text-foreground">
+                            {{ row.value }}
+                          </div>
+                        </div>
+                      </TooltipTrigger>
+                      <TooltipContent v-if="row.tooltip" class="max-w-[520px] whitespace-pre-line break-words text-xs leading-relaxed" side="top" align="start" :side-offset="8">
+                        {{ row.tooltip }}
+                      </TooltipContent>
+                    </Tooltip>
+                  </div>
+                </TooltipProvider>
+                <p v-else class="mt-4 text-sm text-muted-foreground">
+                  {{ t("settings.supportInfoLoading") }}
+                </p>
+                <p v-if="appSupportInfoError" class="mt-3 text-xs text-destructive">
+                  {{
+                    t("settings.supportInfoLoadFailed", {
+                      message: appSupportInfoError,
+                    })
+                  }}
+                </p>
+              </div>
+
+              <SettingsTransferPanel
+                :has-unapplied-changes="hasChanges"
+                :build-saved-export-payload="buildSettingsExportPayload"
+                :build-applied-export-payload="buildAppliedExportPayload"
+                :apply-imported-settings="applyImportedEditorSettings"
+                :get-draft-conflict-categories="getDraftConflictCategories"
+              />
+
+              <div v-if="!isWeb" class="settings-item flex flex-col gap-3 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="flex items-center justify-between gap-4">
+                  <div class="space-y-1">
+                    <Label for="debug-logging-enabled">{{ t("settings.debugLoggingEnabled") }}</Label>
+                    <p class="text-xs text-muted-foreground">
+                      {{ t("settings.debugLoggingEnabledDescription") }}
+                    </p>
+                  </div>
+                  <Switch id="debug-logging-enabled" v-model="editDebugLoggingEnabled" />
+                </div>
+                <div class="flex justify-end gap-2">
+                  <Button type="button" variant="outline" size="sm" @click="clearDebugLogs">
+                    {{ t("settings.debugLogsClear") }}
+                  </Button>
+                  <Button type="button" variant="outline" size="sm" @click="copyDebugLogs">
+                    {{ debugLogCopied ? t("settings.debugLogsCopied") : t("settings.debugLogsCopy") }}
+                  </Button>
+                  <Button type="button" variant="outline" size="sm" @click="exportDebugLogs">
+                    {{ debugLogDownloaded ? t("settings.debugLogsDownloaded") : t("settings.debugLogsDownload") }}
+                  </Button>
+                </div>
+              </div>
+
+              <div class="settings-item flex flex-col gap-4 rounded-lg border p-4">
+                <div class="flex items-center justify-between gap-4">
+                  <div class="min-w-0 space-y-1">
+                    <Label for="update-notifications-enabled">{{ t("settings.updateNotificationsEnabled") }}</Label>
+                    <p class="text-sm text-muted-foreground">
+                      {{ t("settings.updateNotificationsEnabledDescription") }}
+                    </p>
+                  </div>
+                  <Switch id="update-notifications-enabled" v-model="editUpdateNotificationsEnabled" />
+                </div>
+                <div class="flex items-center justify-between gap-4">
+                  <div class="min-w-0 space-y-1">
+                    <Label for="auto-download-updates">{{ t("settings.autoDownloadUpdates") }}</Label>
+                    <p class="text-sm text-muted-foreground">
+                      {{ t("settings.autoDownloadUpdatesDescription") }}
+                    </p>
+                  </div>
+                  <Switch id="auto-download-updates" v-model="editAutoDownloadUpdates" />
+                </div>
+                <div class="flex flex-col gap-3 border-t border-border/60 pt-4 sm:flex-row sm:items-center sm:justify-between">
+                  <div class="min-w-0 space-y-1">
+                    <Label>{{ t("settings.updateDownloadSource") }}</Label>
+                    <p class="text-sm text-muted-foreground">
+                      {{ t("settings.updateDownloadSourceDescription") }}
+                    </p>
+                  </div>
+                  <Select :model-value="editUpdateDownloadSource" @update:model-value="onUpdateDownloadSourceChange">
+                    <SelectTrigger class="h-9 w-full sm:w-[180px]">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="official">{{ t("settings.updateDownloadSourceOfficial") }}</SelectItem>
+                      <SelectItem value="cnb">{{ t("settings.updateDownloadSourceCnb") }}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+
+              <ChangelogPanel :checking-updates="props.checkingUpdates" @check-updates="emit('check-updates')" />
+
+              <div class="grid gap-3 sm:grid-cols-3">
+                <button type="button" class="rounded-lg border p-4 text-left transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" @click="openExternalUrl('https://qm.qq.com/cgi-bin/qm/qr?k=&group_code=1087880322')">
+                  <div class="flex items-center gap-2 text-sm font-medium">
+                    <img
+                      src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIGhlaWdodD0iODYiIHdpZHRoPSI4NiIgdmlld0JveD0iMCAwIDEyMCAxNDUiPjxwYXRoIGZpbGw9IiNmYWFiMDciIGQ9Ik02MC41MDMgMTQyLjIzN2MtMTIuNTMzIDAtMjQuMDM4LTQuMTk1LTMxLjQ0NS0xMC40Ni0zLjc2MiAxLjEyNC04LjU3NCAyLjkzMi0xMS42MSA1LjE3NS0yLjYgMS45MTgtMi4yNzUgMy44NzQtMS44MDcgNC42NjMgMi4wNTYgMy40NyAzNS4yNzMgMi4yMTYgNDQuODYyIDEuMTM2em0wIDBjMTIuNTM1IDAgMjQuMDM5LTQuMTk1IDMxLjQ0Ny0xMC40NiAzLjc2IDEuMTI0IDguNTczIDIuOTMyIDExLjYxIDUuMTc1IDIuNTk4IDEuOTE4IDIuMjc0IDMuODc0IDEuODA1IDQuNjYzLTIuMDU2IDMuNDctMzUuMjcyIDIuMjE2LTQ0Ljg2MiAxLjEzNnptMCAwIi8+PHBhdGggZD0iTTYwLjU3NiA2Ny4xMTljMjAuNjk4LS4xNCAzNy4yODYtNC4xNDcgNDIuOTA3LTUuNjgzIDEuMzQtLjM2NyAyLjA1Ni0xLjAyNCAyLjA1Ni0xLjAyNC4wMDUtLjE4OS4wODUtMy4zNy4wODUtNS4wMUMxMDUuNjI0IDI3Ljc2OCA5Mi41OC4wMDEgNjAuNSAwIDI4LjQyLjAwMSAxNS4zNzUgMjcuNzY5IDE1LjM3NSA1NS40MDFjMCAxLjY0Mi4wOCA0LjgyMi4wODYgNS4wMSAwIDAgLjU4My42MTUgMS42NS45MTMgNS4xOSAxLjQ0NCAyMi4wOSA1LjY1IDQzLjMxMiA1Ljc5NXptNTYuMjQ1IDIzLjAyYy0xLjI4My00LjEyOS0zLjAzNC04Ljk0NC00LjgwOC0xMy41NjggMCAwLTEuMDItLjEyNi0xLjUzNy4wMjMtMTUuOTEzIDQuNjIzLTM1LjIwMiA3LjU3LTQ5LjkgNy4zOTJoLS4xNTNjLTE0LjYxNi4xNzUtMzMuNzc0LTIuNzM3LTQ5LjYzNC03LjMxNS0uNjA2LS4xNzUtMS44MDItLjEtMS44MDItLjEtMS43NzQgNC42MjQtMy41MjUgOS40NC00LjgwOCAxMy41NjgtNi4xMTkgMTkuNjktNC4xMzYgMjcuODM4LTIuNjI3IDI4LjAyIDMuMjM5LjM5MiAxMi42MDYtMTQuODIxIDEyLjYwNi0xNC44MjEgMCAxNS40NTkgMTMuOTU3IDM5LjE5NSA0NS45MTggMzkuNDEzaC44NDhjMzEuOTYtLjIxOCA0NS45MTctMjMuOTU0IDQ1LjkxNy0zOS40MTMgMCAwIDkuMzY4IDE1LjIxMyAxMi42MDcgMTQuODIyIDEuNTA4LS4xODMgMy40OTEtOC4zMzItMi42MjctMjguMDIxIi8+PHBhdGggZmlsbD0iI2ZmZiIgZD0iTTQ5LjA4NSA0MC44MjRjLTQuMzUyLjE5Ny04LjA3LTQuNzYtOC4zMDQtMTEuMDYzLS4yMzYtNi4zMDUgMy4wOTgtMTEuNTc2IDcuNDUtMTEuNzczIDQuMzQ3LS4xOTUgOC4wNjQgNC43NiA4LjMgMTEuMDY1LjIzOCA2LjMwNi0zLjA5NyAxMS41NzctNy40NDYgMTEuNzcxbTMxLjEzMy0xMS4wNjNjLS4yMzMgNi4zMDItMy45NTEgMTEuMjYtOC4zMDMgMTEuMDYzLTQuMzUtLjE5NS03LjY4NC01LjQ2NS03LjQ0Ni0xMS43Ny4yMzYtNi4zMDUgMy45NTItMTEuMjYgOC4zLTExLjA2NiA0LjM1Mi4xOTcgNy42ODYgNS40NjggNy40NDkgMTEuNzczIi8+PHBhdGggZmlsbD0iI2ZhYWIwNyIgZD0iTTg3Ljk1MiA0OS43MjVDODYuNzkgNDcuMTUgNzUuMDc3IDQ0LjI4IDYwLjU3OCA0NC4yOGgtLjE1NmMtMTQuNSAwLTI2LjIxMiAyLjg3LTI3LjM3NSA1LjQ0NmEuODYzLjg2MyAwIDAwLS4wODUuMzY3Ljg4Ljg4IDAgMDAuMTYuNDk2Yy45OCAxLjQyNyAxMy45ODUgOC40ODcgMjcuMyA4LjQ4N2guMTU2YzEzLjMxNCAwIDI2LjMxOS03LjA1OCAyNy4yOTktOC40ODdhLjg3My44NzMgMCAwMC4xNi0uNDk4Ljg1Ni44NTYgMCAwMC0uMDg1LS4zNjUiLz48cGF0aCBkPSJNNTQuNDM0IDI5Ljg1NGMuMTk5IDIuNDktMS4xNjcgNC43MDItMy4wNDYgNC45NDMtMS44ODMuMjQyLTMuNTY4LTEuNTgtMy43NjgtNC4wNy0uMTk3LTIuNDkyIDEuMTY3LTQuNzA0IDMuMDQzLTQuOTQ0IDEuODg2LS4yNDQgMy41NzQgMS41OCAzLjc3MSA0LjA3bTExLjk1Ni44MzNjLjM4NS0uNjg5IDMuMDA0LTQuMzEyIDguNDI3LTIuOTkzIDEuNDI1LjM0NyAyLjA4NC44NTcgMi4yMjMgMS4wNTcuMjA1LjI5Ni4yNjIuNzE4LjA1MyAxLjI4Ni0uNDEyIDEuMTI2LTEuMjYzIDEuMDk1LTEuNzM0Ljg3NS0uMzA1LS4xNDItNC4wODItMi42Ni03LjU2MiAxLjA5Ny0uMjQuMjU3LS42NjguMzQ2LTEuMDczLjA0LS40MDctLjMwOC0uNTc0LS45My0uMzM0LTEuMzYyIi8+PHBhdGggZmlsbD0iI2ZmZiIgZD0iTTYwLjU3NiA4My4wOGgtLjE1M2MtOS45OTYuMTItMjIuMTE2LTEuMjA0LTMzLjg1NC0zLjUxOC0xLjAwNCA1LjgxOC0xLjYxIDEzLjEzMi0xLjA5IDIxLjg1MyAxLjMxNiAyMi4wNDMgMTQuNDA3IDM1LjkgMzQuNjE0IDM2LjFoLjgyYzIwLjIwOC0uMiAzMy4yOTgtMTQuMDU3IDM0LjYxNi0zNi4xLjUyLTguNzIzLS4wODctMTYuMDM1LTEuMDkyLTIxLjg1NC0xMS43MzkgMi4zMTUtMjMuODYyIDMuNjQtMzMuODYgMy41MTgiLz48cGF0aCBmaWxsPSIjZWIxOTIzIiBkPSJNMzIuMTAyIDgxLjIzNXYyMS42OTNzOS45MzcgMi4wMDQgMTkuODkzLjYxNlY4My41MzVjLTYuMzA3LS4zNTctMTMuMTA5LTEuMTUyLTE5Ljg5My0yLjMiLz48cGF0aCBmaWxsPSIjZWIxOTIzIiBkPSJNMTA1LjUzOSA2MC40MTJzLTE5LjMzIDYuMTAyLTQ0Ljk2MyA2LjI3NWgtLjE1M2MtMjUuNTkxLS4xNzItNDQuODk2LTYuMjU1LTQ0Ljk2Mi02LjI3NUw4Ljk4NyA3Ni41N2MxNi4xOTMgNC44ODIgMzYuMjYxIDguMDI4IDUxLjQzNiA3Ljg0NWguMTUzYzE1LjE3NS4xODMgMzUuMjQyLTIuOTYzIDUxLjQzNy03Ljg0NXptMCAwIi8+PC9zdmc+"
+                      alt="QQ"
+                      class="h-7 w-7 rounded-md bg-white p-1"
+                    />
+                    {{ t("settings.qqGroup") }}
+                    <ExternalLink class="ml-auto h-3.5 w-3.5 text-muted-foreground" />
+                  </div>
+                  <div class="mt-1 font-mono text-base">1087880322</div>
+                </button>
+                <button type="button" class="rounded-lg border p-4 text-left transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" @click="openExternalUrl('https://discord.gg/W7NyVDRt6a')">
+                  <div class="flex items-center gap-2 text-sm font-medium">
+                    <img src="https://cdn.simpleicons.org/discord/5865F2" alt="Discord" class="h-7 w-7 rounded-md bg-white p-1" />
+                    Discord
+                    <ExternalLink class="ml-auto h-3.5 w-3.5 text-muted-foreground" />
+                  </div>
+                  <div class="mt-1 text-sm text-primary">discord.gg/W7NyVDRt6a</div>
+                </button>
+                <button type="button" class="rounded-lg border p-4 text-left transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" @click="openExternalUrl('https://docs.qq.com/doc/DVVhMY0h1ekJqc0tz')">
+                  <div class="flex items-center gap-2 text-sm font-medium">
+                    <span class="flex h-7 w-7 items-center justify-center rounded-md bg-[#07C160] text-white">
+                      <svg class="h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                        <path
+                          d="M9.5 4C5.36 4 2 6.69 2 10c0 1.89 1.08 3.56 2.78 4.66l-.7 2.1 2.46-1.23c.87.27 1.8.42 2.78.42.24 0 .48-.01.71-.03A5.93 5.93 0 0 1 10 14c0-3.31 3.13-6 7-6 .34 0 .67.03 1 .07C17.27 5.56 13.72 4 9.5 4Zm-3 4.5a1 1 0 1 1 0-2 1 1 0 0 1 0 2Zm5 0a1 1 0 1 1 0-2 1 1 0 0 1 0 2ZM22 14c0-2.76-2.69-5-6-5s-6 2.24-6 5 2.69 5 6 5c.73 0 1.43-.11 2.09-.3l1.72.86-.49-1.46C20.94 17.07 22 15.64 22 14Zm-7.5-.5a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5Zm4 0a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5Z"
+                        />
+                      </svg>
+                    </span>
+                    {{ t("settings.wechatGroup") }}
+                    <ExternalLink class="ml-auto h-3.5 w-3.5 text-muted-foreground" />
+                  </div>
+                  <div class="mt-1 text-sm text-primary">
+                    {{ t("settings.wechatGroupInvite") }}
+                  </div>
+                </button>
+                <button
+                  type="button"
+                  class="rounded-lg border p-4 text-left transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  @click="openExternalUrl('https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=30cvb14f-a9b1-4b12-adb6-2ff6d476a227')"
+                >
+                  <div class="flex items-center gap-2 text-sm font-medium">
+                    <span class="flex h-7 w-7 items-center justify-center rounded-md bg-[#3370FF] text-white">
+                      <svg class="h-4 w-4" viewBox="164 204 762 617" fill="currentColor" aria-hidden="true">
+                        <path
+                          d="M559.915 530.453c-46.507-111.786-194.56-248.469-262.806-302.826h333.782c47.146 16.298 87.616 134.677 101.973 191.808-35.499 31.21-119.787 97.109-172.95 111.018zM632.021 452.992c-45.184 60.48-133.546 121.963-172.053 145.13l-2.88 24.278 235.947 63.637c32.213-25.962 103.061-87.296 128.96-124.928 4.394-6.378 68.992-135.914 79.402-151.552-18.24-11.306-42.56-18.261-104.277-21.738-82.56-4.331-116.437 20.864-165.099 65.173zM187.883 712.917V393.515C397.568 599.808 558.315 642.688 641.045 653.76c124.459 5.419 154.667-73.045 181.142-93.099-97.024 153.174-224.64 235.734-384.747 235.734-128.107 0-219.755-55.659-249.557-83.478z"
+                        />
+                      </svg>
+                    </span>
+                    {{ t("settings.feishuGroup") }}
+                    <ExternalLink class="ml-auto h-3.5 w-3.5 text-muted-foreground" />
+                  </div>
+                  <div class="mt-1 text-sm text-primary">applink.feishu.cn</div>
+                </button>
+                <button type="button" class="rounded-lg border p-4 text-left transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" @click="openExternalUrl('https://github.com/t8y2/dbx')">
+                  <div class="flex items-center gap-2 text-sm font-medium">
+                    <img src="https://cdn.simpleicons.org/github/181717" alt="GitHub" class="h-7 w-7 rounded-md bg-white p-1" />
+                    {{ t("settings.openSource") }}
+                    <ExternalLink class="ml-auto h-3.5 w-3.5 text-muted-foreground" />
+                  </div>
+                  <div class="mt-1 text-sm text-primary">github.com/t8y2/dbx</div>
+                </button>
+                <button type="button" class="rounded-lg border p-4 text-left transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" @click="openExternalUrl('https://dbxio.com')">
+                  <div class="flex items-center gap-2 text-sm font-medium">
+                    <AppLogo class="h-7 w-7" />
+                    {{ t("settings.officialDocs") }}
+                    <ExternalLink class="ml-auto h-3.5 w-3.5 text-muted-foreground" />
+                  </div>
+                  <div class="mt-1 text-sm text-primary">dbxio.com</div>
+                </button>
+              </div>
+            </section>
           </div>
 
           <DialogFooter v-if="hasSettingsApplyFooter(activeSettingsTab as SettingsCategory)" class="mx-0 mb-0 flex-row flex-wrap items-center justify-end gap-2 rounded-none border-t border-border/60 bg-transparent px-0 pb-0 pt-3 sm:flex-row sm:gap-2 [&>button]:w-auto [&>button]:shrink-0">
@@ -9235,6 +10087,22 @@ LIMIT 100;</pre
               {{ t("auth.changePassword") }}
             </Button>
           </DialogFooter>
+
+          <DialogFooter v-else-if="activeSettingsTab === 'about'" class="mx-0 mb-0 flex-row flex-wrap items-center justify-end gap-2 rounded-none border-t border-border/60 bg-transparent px-0 pb-0 pt-3 sm:flex-row sm:gap-2 [&>button]:w-auto [&>button]:shrink-0">
+            <Button variant="outline" @click="resetAllDefaults">
+              {{ t("settings.resetAllDefaults") }}
+            </Button>
+            <div class="flex-1" />
+            <Button variant="outline" @click="closeSettings">
+              {{ t("common.close") }}
+            </Button>
+            <Button :disabled="!hasChanges() || hasApplyBlocker" @click="applySettings">
+              {{ t("settings.apply") }}
+            </Button>
+            <Button :disabled="!hasChanges() || hasApplyBlocker" @click="applySettingsAndClose">
+              {{ t("settings.applyAndClose") }}
+            </Button>
+          </DialogFooter>
         </div>
       </div>
     </component>
@@ -9301,7 +10169,7 @@ LIMIT 100;</pre
 
     <!-- SQL Shortcut Add/Edit Dialog -->
     <Dialog :open="sqlShortcutDialogOpen" @update:open="sqlShortcutDialogOpen = $event">
-      <DialogContent class="sm:max-w-[560px]">
+      <DialogContent class="sm:max-w-[600px]">
         <DialogHeader>
           <DialogTitle>
             {{ sqlShortcutEditingId ? t("settings.sqlShortcutsEditTitle") : t("settings.sqlShortcutsAddTitle") }}
@@ -9310,7 +10178,8 @@ LIMIT 100;</pre
         <div class="flex flex-col gap-4 py-2">
           <div class="flex flex-col gap-1.5">
             <Label for="sql-shortcut-label">{{ t("settings.sqlShortcutsLabel") }}</Label>
-            <Input id="sql-shortcut-label" v-model="sqlShortcutForm.label" :placeholder="t('settings.sqlShortcutsLabelPlaceholder')" />
+            <Input v-if="!sqlShortcutFormIsBuiltin" id="sql-shortcut-label" v-model="sqlShortcutForm.label" :placeholder="t('settings.sqlShortcutsLabelPlaceholder')" />
+            <Input v-else id="sql-shortcut-label" :model-value="sqlShortcutFormBuiltinLabel" readonly class="bg-muted" />
             <p v-if="sqlShortcutFormLabelError" class="text-xs text-destructive">
               {{ sqlShortcutFormLabelError }}
             </p>
@@ -9340,19 +10209,104 @@ LIMIT 100;</pre
               </Button>
             </div>
           </div>
-          <div class="flex flex-col gap-1.5">
-            <Label for="sql-shortcut-sql">{{ t("settings.sqlShortcutsSql") }}</Label>
-            <textarea
-              id="sql-shortcut-sql"
-              v-model="sqlShortcutForm.sql"
-              :placeholder="t('settings.sqlShortcutsSqlPlaceholder')"
-              rows="6"
-              class="flex min-h-[120px] w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm font-mono shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-            />
+
+          <!-- Built-in select-limit: row count + dialect preview -->
+          <template v-if="sqlShortcutFormIsBuiltin && sqlShortcutForm.kind === 'select-limit'">
+            <div class="flex flex-col gap-1.5">
+              <Label for="sql-shortcut-limit">{{ t("settings.sqlShortcutsLimit") }}</Label>
+              <Input id="sql-shortcut-limit" type="number" min="1" max="100000" v-model.number="sqlShortcutForm.limit" class="w-32" />
+            </div>
+            <div class="flex flex-col gap-1.5">
+              <div class="flex items-center justify-between gap-2">
+                <Label>{{ t("settings.sqlShortcutsPreview") }}</Label>
+                <Select v-model="sqlShortcutPreviewDatabaseType">
+                  <SelectTrigger class="h-8 w-[160px]">
+                    <SelectValue :placeholder="t('settings.sqlShortcutsPreviewDatabase')" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem v-for="dbType in dbTypeOptions" :key="dbType" :value="dbType">
+                      {{ dbTypeLabel(dbType) }}
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <pre class="overflow-x-auto whitespace-pre-wrap rounded-md border bg-muted/30 px-3 py-2 font-mono text-xs leading-relaxed">{{ sqlShortcutFormPreviewSql }}</pre>
+              <p class="text-xs text-muted-foreground">{{ t("settings.sqlShortcutsSelectLimitHint") }}</p>
+            </div>
+          </template>
+
+          <!-- Built-in count: read-only SQL -->
+          <div v-else-if="sqlShortcutFormIsBuiltin" class="flex flex-col gap-1.5">
+            <Label>{{ t("settings.sqlShortcutsSql") }}</Label>
+            <pre class="overflow-x-auto whitespace-pre-wrap rounded-md border bg-muted/30 px-3 py-2 font-mono text-xs leading-relaxed">{{ sqlShortcutForm.sql }}</pre>
             <p class="text-xs text-muted-foreground">
               {{ t("settings.sqlShortcutsVariableHint", { token: SQL_SHORTCUT_TABLE_TOKEN }) }}
             </p>
           </div>
+
+          <!-- Custom add/edit: databases + SQL (optional per-DB body) -->
+          <template v-else>
+            <div class="flex flex-col gap-1.5">
+              <Label>{{ t("settings.sqlShortcutsDatabaseTypes") }}</Label>
+              <div class="flex flex-wrap items-center gap-2">
+                <Popover :open="sqlShortcutDatabaseTypesOpen" @update:open="(open) => (sqlShortcutDatabaseTypesOpen = open)">
+                  <PopoverTrigger as-child>
+                    <Button type="button" variant="outline" size="sm" class="h-8">
+                      {{ sqlShortcutForm.databaseTypes.length === 0 ? t("settings.sqlShortcutsDatabaseTypesAll") : t("settings.sqlShortcutsDatabaseTypesSelected", { count: sqlShortcutForm.databaseTypes.length }) }}
+                      <ChevronDown class="ml-1 h-3.5 w-3.5 opacity-60" />
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent align="start" class="w-64 p-2">
+                    <button type="button" class="mb-1 flex w-full items-center gap-2 rounded-sm px-1 py-1 text-xs hover:bg-muted" @click="clearSqlShortcutDatabaseTypes">
+                      <div class="flex h-4 w-4 shrink-0 items-center justify-center rounded-sm border" :class="sqlShortcutForm.databaseTypes.length === 0 ? 'border-primary bg-primary text-primary-foreground' : ''">
+                        <Check v-if="sqlShortcutForm.databaseTypes.length === 0" class="h-3 w-3" />
+                      </div>
+                      {{ t("settings.sqlShortcutsDatabaseTypesAll") }}
+                    </button>
+                    <div class="max-h-48 overflow-auto border-t border-border/60 pt-1">
+                      <button v-for="dbType in dbTypeOptions" :key="dbType" type="button" class="flex w-full items-center gap-2 rounded-sm px-1 py-1 text-xs hover:bg-muted" @click="toggleSqlShortcutDatabaseType(dbType)">
+                        <div class="flex h-4 w-4 shrink-0 items-center justify-center rounded-sm border" :class="sqlShortcutForm.databaseTypes.includes(dbType) ? 'border-primary bg-primary text-primary-foreground' : ''">
+                          <Check v-if="sqlShortcutForm.databaseTypes.includes(dbType)" class="h-3 w-3" />
+                        </div>
+                        {{ dbTypeLabel(dbType) }}
+                      </button>
+                    </div>
+                  </PopoverContent>
+                </Popover>
+              </div>
+              <p class="text-xs text-muted-foreground">{{ t("settings.sqlShortcutsDatabaseTypesHint") }}</p>
+            </div>
+            <div class="flex flex-col gap-1.5">
+              <div class="flex items-center justify-between gap-2">
+                <Label for="sql-shortcut-sql">{{ t("settings.sqlShortcutsSql") }}</Label>
+                <div v-if="sqlShortcutForm.databaseTypes.length > 0" class="flex items-center gap-2">
+                  <Select :model-value="sqlShortcutForm.editingDatabaseType || sqlShortcutForm.databaseTypes[0]" @update:model-value="(value) => onSqlShortcutEditingDatabaseTypeChange((value as DatabaseType) || '')">
+                    <SelectTrigger class="h-8 w-[160px]">
+                      <SelectValue :placeholder="t('settings.sqlShortcutsSqlDatabase')" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem v-for="dbType in sqlShortcutForm.databaseTypes" :key="dbType" :value="dbType">
+                        {{ dbTypeLabel(dbType) }}
+                      </SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <Button type="button" variant="outline" size="sm" class="h-8 shrink-0" @click="applySqlShortcutSqlToAllSelected">
+                    {{ t("settings.sqlShortcutsApplySqlToAllSelected") }}
+                  </Button>
+                </div>
+              </div>
+              <textarea
+                id="sql-shortcut-sql"
+                v-model="sqlShortcutForm.body"
+                :placeholder="t('settings.sqlShortcutsSqlPlaceholder')"
+                rows="6"
+                class="flex min-h-[120px] w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm font-mono shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              />
+              <p class="text-xs text-muted-foreground">
+                {{ t("settings.sqlShortcutsVariableHint", { token: SQL_SHORTCUT_TABLE_TOKEN }) }}
+              </p>
+            </div>
+          </template>
         </div>
         <DialogFooter>
           <Button variant="outline" @click="sqlShortcutDialogOpen = false">{{ t("settings.cancel") }}</Button>
@@ -9625,6 +10579,34 @@ html.dbx-legacy-webview .settings-layout .settings-mcp-config-tab {
 
 html.dbx-legacy-webview .settings-ai-back-button {
   margin-left: -0.625rem !important;
+}
+
+html.dbx-legacy-webview .settings-about-section-header {
+  display: flex !important;
+  flex-direction: row !important;
+  align-items: flex-start !important;
+  justify-content: space-between !important;
+  gap: 0.75rem !important;
+}
+
+html.dbx-legacy-webview .settings-about-section-actions {
+  display: flex !important;
+  flex-wrap: wrap !important;
+  align-items: center !important;
+  justify-content: flex-end !important;
+  margin-left: auto !important;
+  gap: 0.5rem !important;
+}
+
+@media (max-width: 640px) {
+  html.dbx-legacy-webview .settings-about-section-header {
+    flex-direction: column !important;
+  }
+
+  html.dbx-legacy-webview .settings-about-section-actions {
+    justify-content: flex-start !important;
+    margin-left: 0 !important;
+  }
 }
 
 @media (max-width: 760px) {
